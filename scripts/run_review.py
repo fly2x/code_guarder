@@ -83,7 +83,7 @@ def generate_review_prompt(context: dict, reviewer: str = 'codex') -> str:
     # Categorize files
     file_categories = categorize_files(changed_files)
 
-    prompt = f"""# Code Review Task
+    prompt = f"""# Change Review Task
 
 You are reviewing PR #{pr_id} for {owner}/{repo}.
 {f'**Title**: {title}' if title else ''}
@@ -94,7 +94,7 @@ You are reviewing PR #{pr_id} for {owner}/{repo}.
 
 ## Your Task
 
-Perform a thorough code review by:
+Perform a thorough change review by:
 
 1. **Understand the Change**
    - Read the diff stats: `git diff --stat {base_ref} {head_ref}`
@@ -104,6 +104,7 @@ Perform a thorough code review by:
    - For each changed file, view its diff: `git diff {base_ref} {head_ref} -- <file>`
    - If you need more context, read the full file or search for related code
    - Look for: security issues, logic errors, edge cases, error handling
+   - For non-code files (docs/config), focus on correctness and safety of the content
 
 3. **Track Dependencies**
    - When you find a changed function, check its callers
@@ -115,6 +116,9 @@ Perform a thorough code review by:
    - Logic: null/nil checks, boundary conditions, error paths
    - API: breaking changes, compatibility, proper error returns
    - Resources: leaks, proper cleanup, race conditions
+   - Documentation (Markdown/docs): incorrect or outdated instructions, wrong flags/paths,
+     broken references, misleading examples, missing steps, or unsafe guidance
+   - Config/build/CI: insecure defaults, mismatched versions, missing required keys
 
 ## Output Format - CRITICAL
 
@@ -144,9 +148,10 @@ FIX:
 - ONLY output ===ISSUE=== blocks, nothing else
 - Do NOT write summaries or conclusions
 - Do NOT use markdown headers or bullet points outside of issue blocks
-- Only flag issues in CHANGED code (not pre-existing issues)
+- Only flag issues in CHANGED lines (code or docs, not pre-existing issues)
 - Be specific with line numbers
 - Provide working fixes, not just descriptions
+  - For docs, FIX should be the corrected text/snippet
 
 Start the review now. Output each issue as you find it.
 """
@@ -167,7 +172,7 @@ def categorize_files(files: list[str]) -> dict:
         f_lower = f.lower()
         if 'test' in f_lower or f_lower.endswith('_test.go') or f_lower.endswith('.test.js'):
             categories['test'].append(f)
-        elif f_lower.endswith(('.md', '.rst', '.txt', '.doc')):
+        elif f_lower.endswith(('.md', '.mdx', '.markdown', '.rst', '.adoc', '.asciidoc', '.txt', '.doc', '.docx')):
             categories['docs'].append(f)
         elif f_lower.endswith(('.json', '.yaml', '.yml', '.toml', '.ini', '.cfg')):
             categories['config'].append(f)
@@ -893,9 +898,9 @@ def generate_consolidation_prompt(review_reports: dict[str, Path], context: dict
 
     all_reports = "\n\n---\n\n".join(reports_content)
 
-    prompt = f"""# Code Review Consolidation Task
+    prompt = f"""# Change Review Consolidation Task
 
-You are consolidating code review findings from multiple AI reviewers.
+You are consolidating change review findings from multiple AI reviewers.
 
 ## Context
 - Repository: {context.get('owner', '')}/{context.get('repo', '')}
@@ -914,7 +919,7 @@ You are consolidating code review findings from multiple AI reviewers.
    - Note issues unique to each reviewer
 
 2. **Validate Issues**
-   - For each issue, verify it's a real problem by checking the code
+   - For each issue, verify it's a real problem by checking the file (code or docs)
    - Use `git diff` and file reads to confirm
    - Remove false positives
    - Adjust severity if needed
@@ -956,7 +961,7 @@ FIX:
 
 - SEVERITY indicates impact level (critical/high/medium/low)
 - CONFIDENCE indicates how certain we are about this issue
-- Only include issues you've verified in the code
+- Only include issues you've verified in the changed files (code or docs)
 - Prefer fixes that are most complete and correct
 - Add REVIEWERS field showing which AIs found this issue
 

@@ -29,7 +29,7 @@ FIX:
 Claude Code is the primary reviewer, focusing on architecture, security, and complex logic.
 
 ````
-Review this code diff for issues. Output each issue in this exact format:
+Review this change diff for issues (code, docs, config). Output each issue in this exact format:
 
 ===ISSUE===
 FILE: <filepath>
@@ -53,9 +53,10 @@ Focus areas:
 3. Complex logic bugs (race conditions, deadlocks, state corruption, edge cases)
 4. Resource issues (leaks, unbounded growth, missing cleanup)
 5. Error handling gaps (swallowed exceptions, missing validation)
+6. Documentation accuracy (incorrect commands/flags/paths, outdated steps, broken references)
 
 Rules:
-- Only flag issues in CHANGED lines (lines starting with +)
+- Only flag issues in CHANGED lines (code or docs)
 - Include exact line numbers from the diff
 - Provide compilable/runnable fix code
 - Skip pure style issues
@@ -69,7 +70,7 @@ DIFF:
 Gemini handles pattern recognition, documentation, and cross-file analysis.
 
 ````
-Analyze this code diff for issues. Output format:
+Analyze this change diff for issues (code, docs, config). Output format:
 
 ===ISSUE===
 FILE: <filepath>
@@ -93,9 +94,10 @@ Focus areas:
 3. Logic flow issues (unreachable code, infinite loops)
 4. Import/dependency problems
 5. Configuration issues (hardcoded values, missing env checks)
+6. Documentation problems (incorrect examples, missing steps, broken links)
 
 Rules:
-- Changed lines only
+- Changed lines only (code or docs)
 - Exact line numbers
 - Practical fixes
 - Skip style-only

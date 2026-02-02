@@ -9,6 +9,7 @@ Multi-AI collaborative code review system. Uses Claude Code, Gemini CLI, and Cod
 | Multi-AI Review | Codex (default) + Claude + Gemini run in parallel |
 | Agent Mode | AIs explore codebase on demand, no context limit |
 | Cross-validation | Merge duplicates, mark confidence levels |
+| Documentation Review | Reviews Markdown/docs changes for correctness and safety |
 | Multi-platform | GitHub, GitLab, Gitee, GitCode support |
 
 ## Quick Start
