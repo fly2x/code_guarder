@@ -14,9 +14,22 @@ import subprocess
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Callable
+
+
+@dataclass
+class AgentConfig:
+    """Configuration for AI agent runners."""
+    name: str                      # Agent name (claude, gemini, codex)
+    command: list[str]             # Command to execute
+    color: str                     # ANSI color code
+    cli_name: str                  # CLI executable name
+    not_found_msg: str             # Error message when CLI not found
+    env_setup: Optional[Callable[[dict], dict]] = None  # Optional env setup function
+    timeout: int = 1800            # Timeout in seconds (default: 30 min)
 
 
 class Colors:
@@ -481,18 +494,37 @@ def init_ai_tools(repo_dir: Path, use_claude: bool, use_gemini: bool, use_codex:
 # AI Agent Runners
 # =============================================================================
 
-def run_claude_agent(repo_dir: Path, prompt: str, output_file: Path) -> tuple[Path, list[str]]:
-    """Run Claude Code agent with real-time output streaming."""
-    if not shutil.which('claude'):
-        print_error("Claude CLI not found. Install with: npm install -g @anthropic-ai/claude-code")
+def run_agent_generic(
+    repo_dir: Path,
+    prompt: str,
+    output_file: Path,
+    config: AgentConfig
+) -> tuple[Path, list[str]]:
+    """
+    Generic agent runner with real-time output streaming.
+
+    Args:
+        repo_dir: Repository directory
+        prompt: Review prompt
+        output_file: Output file path
+        config: Agent configuration
+
+    Returns:
+        Tuple of (output_file, output_lines)
+    """
+    # Check if CLI is available
+    if not shutil.which(config.cli_name):
+        print_error(config.not_found_msg)
         return output_file, []
 
-    print(f"\n{Colors.CLAUDE}{'─'*20} Claude Code Review {'─'*20}{Colors.RESET}\n", file=sys.stderr)
+    # Print header
+    print(f"\n{config.color}{'─'*20} {config.name} Review {'─'*20}{Colors.RESET}\n", file=sys.stderr)
 
     output_lines = []
     stderr_lines = []
 
     def read_stderr(proc, stderr_lines):
+        """Read stderr in background thread."""
         try:
             while True:
                 line = proc.stderr.readline()
@@ -501,26 +533,21 @@ def run_claude_agent(repo_dir: Path, prompt: str, output_file: Path) -> tuple[Pa
                 if line:
                     line = line.rstrip('\n')
                     stderr_lines.append(line)
-                    print(f"{Colors.DIM}[claude] {line}{Colors.RESET}", file=sys.stderr)
+                    print(f"{Colors.DIM}[{config.name.lower()}] {line}{Colors.RESET}", file=sys.stderr)
                     sys.stderr.flush()
         except Exception:
             pass
 
+    proc = None
     try:
+        # Setup environment
         env = os.environ.copy()
-        env['PYTHONUNBUFFERED'] = '1'
+        if config.env_setup:
+            env = config.env_setup(env)
 
-        # Use --append-system-prompt to enforce output format
-        # This ensures Claude outputs structured ===ISSUE=== blocks, not summaries
-        format_instruction = (
-            "CRITICAL: Your ONLY output must be ===ISSUE=== blocks. "
-            "Do NOT write summaries, introductions, or conclusions. "
-            "Output each issue immediately when found in the exact format specified."
-        )
-
+        # Start process
         proc = subprocess.Popen(
-            ['claude', '-p', '--output-format', 'text', '--dangerously-skip-permissions',
-             '--append-system-prompt', format_instruction],
+            config.command,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -530,13 +557,18 @@ def run_claude_agent(repo_dir: Path, prompt: str, output_file: Path) -> tuple[Pa
             env=env
         )
 
+        # Start stderr reader thread
         stderr_thread = threading.Thread(target=read_stderr, args=(proc, stderr_lines))
         stderr_thread.daemon = True
         stderr_thread.start()
 
-        proc.stdin.write(prompt)
-        proc.stdin.close()
+        # Write prompt to stdin
+        try:
+            proc.stdin.write(prompt)
+        finally:
+            proc.stdin.close()
 
+        # Read stdout
         while True:
             line = proc.stdout.readline()
             if not line and proc.poll() is not None:
@@ -544,162 +576,99 @@ def run_claude_agent(repo_dir: Path, prompt: str, output_file: Path) -> tuple[Pa
             if line:
                 line = line.rstrip('\n')
                 output_lines.append(line)
-                print(f"{Colors.CLAUDE}[CLAUDE]{Colors.RESET} {line}", file=sys.stderr)
+                print(f"{config.color}[{config.name.upper()}]{Colors.RESET} {line}", file=sys.stderr)
                 sys.stderr.flush()
 
-        proc.wait(timeout=1800)
+        # Wait for process with timeout
+        try:
+            proc.wait(timeout=config.timeout)
+        except subprocess.TimeoutExpired:
+            print_error(f"{config.name} review timed out after {config.timeout // 60} minutes")
+            proc.kill()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.terminate()
+            raise
+
+        # Wait for stderr thread
         stderr_thread.join(timeout=1)
 
-        print(f"\n{Colors.CLAUDE}{'─'*50}{Colors.RESET}\n", file=sys.stderr)
+        # Print footer
+        print(f"\n{config.color}{'─'*50}{Colors.RESET}\n", file=sys.stderr)
 
+        # Save output
         output_file.write_text('\n'.join(output_lines))
         return output_file, output_lines
 
     except subprocess.TimeoutExpired:
-        proc.kill()
-        print_error("Claude review timed out after 30 minutes")
         output_file.write_text('\n'.join(output_lines) if output_lines else '')
         return output_file, output_lines
     except Exception as e:
-        print_error(f"Claude review failed: {e}")
-        output_file.write_text('')
+        print_error(f"{config.name} review failed: {type(e).__name__}: {e}")
+        if proc and proc.poll() is None:
+            proc.kill()
+        output_file.write_text('\n'.join(output_lines) if output_lines else '')
         return output_file, []
+
+
+def run_claude_agent(repo_dir: Path, prompt: str, output_file: Path) -> tuple[Path, list[str]]:
+    """Run Claude Code agent with real-time output streaming."""
+
+    def setup_claude_env(env: dict) -> dict:
+        """Setup environment for Claude."""
+        env['PYTHONUNBUFFERED'] = '1'
+        return env
+
+    # Format instruction to enforce structured output
+    format_instruction = (
+        "CRITICAL: Your ONLY output must be ===ISSUE=== blocks. "
+        "Do NOT write summaries, introductions, or conclusions. "
+        "Output each issue immediately when found in the exact format specified."
+    )
+
+    config = AgentConfig(
+        name='Claude Code',
+        command=['claude', '-p', '--output-format', 'text', '--dangerously-skip-permissions',
+                 '--append-system-prompt', format_instruction],
+        color=Colors.CLAUDE,
+        cli_name='claude',
+        not_found_msg="Claude CLI not found. Install with: npm install -g @anthropic-ai/claude-code",
+        env_setup=setup_claude_env,
+        timeout=1800
+    )
+
+    return run_agent_generic(repo_dir, prompt, output_file, config)
 
 
 def run_gemini_agent(repo_dir: Path, prompt: str, output_file: Path) -> tuple[Path, list[str]]:
     """Run Gemini CLI agent with real-time output streaming."""
-    if not shutil.which('gemini'):
-        print_error("Gemini CLI not found")
-        return output_file, []
 
-    print(f"\n{Colors.GEMINI}{'─'*20} Gemini Review {'─'*20}{Colors.RESET}\n", file=sys.stderr)
+    config = AgentConfig(
+        name='Gemini',
+        command=['gemini', '-y'],
+        color=Colors.GEMINI,
+        cli_name='gemini',
+        not_found_msg="Gemini CLI not found",
+        timeout=1800
+    )
 
-    output_lines = []
-    stderr_lines = []
-
-    def read_stderr(proc, stderr_lines):
-        try:
-            while True:
-                line = proc.stderr.readline()
-                if not line and proc.poll() is not None:
-                    break
-                if line:
-                    line = line.rstrip('\n')
-                    stderr_lines.append(line)
-                    print(f"{Colors.DIM}[gemini] {line}{Colors.RESET}", file=sys.stderr)
-                    sys.stderr.flush()
-        except Exception:
-            pass
-
-    try:
-        proc = subprocess.Popen(
-            ['gemini', '-y'],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            cwd=repo_dir,
-            bufsize=1
-        )
-
-        stderr_thread = threading.Thread(target=read_stderr, args=(proc, stderr_lines))
-        stderr_thread.daemon = True
-        stderr_thread.start()
-
-        proc.stdin.write(prompt)
-        proc.stdin.close()
-
-        while True:
-            line = proc.stdout.readline()
-            if not line and proc.poll() is not None:
-                break
-            if line:
-                line = line.rstrip('\n')
-                output_lines.append(line)
-                print(f"{Colors.GEMINI}[GEMINI]{Colors.RESET} {line}", file=sys.stderr)
-                sys.stderr.flush()
-
-        proc.wait(timeout=1800)
-        stderr_thread.join(timeout=1)
-
-        print(f"\n{Colors.GEMINI}{'─'*50}{Colors.RESET}\n", file=sys.stderr)
-
-        output_file.write_text('\n'.join(output_lines))
-        return output_file, output_lines
-
-    except Exception as e:
-        print_error(f"Gemini review failed: {e}")
-        output_file.write_text('')
-        return output_file, []
+    return run_agent_generic(repo_dir, prompt, output_file, config)
 
 
 def run_codex_agent(repo_dir: Path, prompt: str, output_file: Path) -> tuple[Path, list[str]]:
     """Run Codex CLI agent with real-time output streaming."""
-    if not shutil.which('codex'):
-        print_error("Codex CLI not found")
-        return output_file, []
 
-    print(f"\n{Colors.CODEX}{'─'*20} Codex Review {'─'*20}{Colors.RESET}\n", file=sys.stderr)
+    config = AgentConfig(
+        name='Codex',
+        command=['codex', 'exec', '--full-auto', '-'],
+        color=Colors.CODEX,
+        cli_name='codex',
+        not_found_msg="Codex CLI not found",
+        timeout=1800
+    )
 
-    output_lines = []
-    stderr_lines = []
-
-    def read_stderr(proc, stderr_lines):
-        try:
-            while True:
-                line = proc.stderr.readline()
-                if not line and proc.poll() is not None:
-                    break
-                if line:
-                    line = line.rstrip('\n')
-                    stderr_lines.append(line)
-                    print(f"{Colors.DIM}[codex] {line}{Colors.RESET}", file=sys.stderr)
-                    sys.stderr.flush()
-        except Exception:
-            pass
-
-    try:
-        # Use 'codex exec --full-auto -' to read prompt from stdin
-        # --json outputs events as JSONL to stdout
-        proc = subprocess.Popen(
-            ['codex', 'exec', '--full-auto', '-'],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            cwd=repo_dir,
-            bufsize=1
-        )
-
-        stderr_thread = threading.Thread(target=read_stderr, args=(proc, stderr_lines))
-        stderr_thread.daemon = True
-        stderr_thread.start()
-
-        proc.stdin.write(prompt)
-        proc.stdin.close()
-
-        while True:
-            line = proc.stdout.readline()
-            if not line and proc.poll() is not None:
-                break
-            if line:
-                line = line.rstrip('\n')
-                output_lines.append(line)
-                print(f"{Colors.CODEX}[CODEX]{Colors.RESET} {line}", file=sys.stderr)
-                sys.stderr.flush()
-
-        proc.wait(timeout=1800)
-        stderr_thread.join(timeout=1)
-
-        print(f"\n{Colors.CODEX}{'─'*50}{Colors.RESET}\n", file=sys.stderr)
-
-        output_file.write_text('\n'.join(output_lines))
-        return output_file, output_lines
-
-    except Exception as e:
-        print_error(f"Codex review failed: {e}")
-        output_file.write_text('')
-        return output_file, []
+    return run_agent_generic(repo_dir, prompt, output_file, config)
 
 
 # =============================================================================

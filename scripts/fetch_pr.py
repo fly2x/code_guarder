@@ -18,6 +18,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -167,8 +168,23 @@ def fetch_pr_metadata(pr: PRInfo) -> PRInfo:
                     pr.base_branch = data.get('base', {}).get('ref', 'main')
                     pr.head_branch = data.get('head', {}).get('ref', '')
 
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            print(f"Warning: PR/MR not found ({pr.platform}): {pr.url}", file=sys.stderr)
+        elif e.code == 401 or e.code == 403:
+            print(f"Warning: Authentication failed for {pr.platform}. Set {pr.platform.upper()}_TOKEN environment variable.", file=sys.stderr)
+        elif e.code == 429:
+            print(f"Warning: Rate limit exceeded for {pr.platform} API", file=sys.stderr)
+        else:
+            print(f"Warning: HTTP {e.code} when fetching PR metadata from {pr.platform}: {e.reason}", file=sys.stderr)
+    except urllib.error.URLError as e:
+        print(f"Warning: Network error when fetching PR metadata: {e.reason}", file=sys.stderr)
+    except json.JSONDecodeError as e:
+        print(f"Warning: Invalid JSON response from {pr.platform} API: {e}", file=sys.stderr)
+    except socket.timeout:
+        print(f"Warning: Request timeout when fetching PR metadata from {pr.platform}", file=sys.stderr)
     except Exception as e:
-        print(f"Warning: Could not fetch PR metadata: {e}", file=sys.stderr)
+        print(f"Warning: Unexpected error fetching PR metadata from {pr.platform}: {type(e).__name__}: {e}", file=sys.stderr)
 
     return pr
 
@@ -177,104 +193,154 @@ def fetch_pr_metadata(pr: PRInfo) -> PRInfo:
 # Clone Mode - Clone repo and checkout PR branch
 # =============================================================================
 
+def create_git_credential_helper(platform: str, token: str) -> str:
+    """
+    Create a temporary git credential helper script.
+    Returns the path to the script.
+    """
+    import tempfile
+    cred_helper = tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.sh', prefix='git-cred-')
+
+    cred_helper.write('#!/bin/sh\n')
+    if platform == 'gitlab':
+        cred_helper.write(f'echo "username=oauth2"\necho "password={token}"\n')
+    else:
+        cred_helper.write(f'echo "username={token}"\necho "password="\n')
+    cred_helper.close()
+    os.chmod(cred_helper.name, 0o700)
+
+    return cred_helper.name
+
+
 def clone_pr_repo(pr: PRInfo, target_dir: Path, quiet: bool = False) -> Tuple[Path, str, str]:
     """
     Clone repository and checkout PR branch.
 
     Returns: (repo_path, base_ref, head_ref)
+    Raises: RuntimeError on clone/fetch failures
     """
     env = get_clean_env()
     token = get_token(pr.platform)
 
-    # Build clone URL with token if available
+    # Use clean clone URL without embedded token
     clone_url = pr.clone_url
-    if token and pr.platform in ('github', 'gitlab', 'gitee'):
-        # Insert token into URL for private repos
-        if pr.platform == 'github':
-            clone_url = f"https://{token}@github.com/{pr.owner}/{pr.repo}.git"
-        elif pr.platform == 'gitlab':
-            clone_url = f"https://oauth2:{token}@gitlab.com/{pr.owner}/{pr.repo}.git"
-        elif pr.platform == 'gitee':
-            clone_url = f"https://{token}@gitee.com/{pr.owner}/{pr.repo}.git"
-
     repo_dir = target_dir / pr.repo
 
-    if not quiet:
-        print(f"Cloning {pr.owner}/{pr.repo}...", file=sys.stderr)
+    # Setup credential helper for private repos
+    cred_helper_path = None
+    if token:
+        try:
+            cred_helper_path = create_git_credential_helper(pr.platform, token)
+            env['GIT_ASKPASS'] = cred_helper_path
+            env['GIT_TERMINAL_PROMPT'] = '0'
+        except Exception as e:
+            print(f"Warning: Could not setup git credentials: {e}", file=sys.stderr)
 
-    # Clone with limited depth first
-    subprocess.run(
-        ['git', 'clone', '--depth=100', clone_url, str(repo_dir)],
-        env=env, check=True,
-        capture_output=quiet, timeout=300
-    )
+    try:
+        if not quiet:
+            print(f"Cloning {pr.owner}/{pr.repo}...", file=sys.stderr)
 
-    # Fetch PR ref based on platform
-    if pr.platform == 'github':
-        # GitHub: refs/pull/{id}/head
-        pr_ref = f"refs/pull/{pr.pr_id}/head"
-        local_branch = f"pr-{pr.pr_id}"
+        # Clone with limited depth
+        try:
+            subprocess.run(
+                ['git', 'clone', '--depth=100', clone_url, str(repo_dir)],
+                env=env, check=True,
+                capture_output=quiet, timeout=300
+            )
+        except subprocess.CalledProcessError as e:
+            raise RuntimeError(f"Git clone failed (exit {e.returncode}): {e.stderr.decode() if e.stderr else 'unknown error'}")
+        except subprocess.TimeoutExpired:
+            raise RuntimeError("Git clone timed out after 300 seconds")
 
-        subprocess.run(
-            ['git', 'fetch', 'origin', f"{pr_ref}:{local_branch}"],
-            cwd=repo_dir, env=env, check=True,
-            capture_output=quiet, timeout=120
+        # Fetch PR ref based on platform
+        try:
+            if pr.platform == 'github':
+                # GitHub: refs/pull/{id}/head
+                pr_ref = f"refs/pull/{pr.pr_id}/head"
+                local_branch = f"pr-{pr.pr_id}"
+
+                subprocess.run(
+                    ['git', 'fetch', 'origin', f"{pr_ref}:{local_branch}"],
+                    cwd=repo_dir, env=env, check=True,
+                    capture_output=quiet, timeout=120
+                )
+
+            elif pr.platform == 'gitlab' or pr.platform == 'gitcode':
+                # GitLab/GitCode: refs/merge-requests/{id}/head
+                pr_ref = f"refs/merge-requests/{pr.pr_id}/head"
+                local_branch = f"mr-{pr.pr_id}"
+
+                subprocess.run(
+                    ['git', 'fetch', 'origin', f"{pr_ref}:{local_branch}"],
+                    cwd=repo_dir, env=env, check=True,
+                    capture_output=quiet, timeout=120
+                )
+
+            elif pr.platform == 'gitee':
+                # Gitee: refs/pull/{id}/head
+                pr_ref = f"refs/pull/{pr.pr_id}/head"
+                local_branch = f"pr-{pr.pr_id}"
+
+                subprocess.run(
+                    ['git', 'fetch', 'origin', f"{pr_ref}:{local_branch}"],
+                    cwd=repo_dir, env=env, check=True,
+                    capture_output=quiet, timeout=120
+                )
+        except subprocess.CalledProcessError as e:
+            shutil.rmtree(repo_dir, ignore_errors=True)
+            raise RuntimeError(f"Git fetch PR ref failed (exit {e.returncode}): {e.stderr.decode() if e.stderr else 'unknown error'}")
+        except subprocess.TimeoutExpired:
+            shutil.rmtree(repo_dir, ignore_errors=True)
+            raise RuntimeError("Git fetch timed out after 120 seconds")
+
+        # Ensure we have enough history for merge-base
+        try:
+            subprocess.run(
+                ['git', 'fetch', '--deepen=200', 'origin', pr.base_branch],
+                cwd=repo_dir, env=env,
+                capture_output=True, timeout=120
+            )
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            # Non-fatal, continue with what we have
+            pass
+
+        # Find merge base
+        merge_base_result = subprocess.run(
+            ['git', 'merge-base', f'origin/{pr.base_branch}', local_branch],
+            cwd=repo_dir, env=env,
+            capture_output=True, text=True
         )
 
-    elif pr.platform == 'gitlab' or pr.platform == 'gitcode':
-        # GitLab/GitCode: refs/merge-requests/{id}/head
-        pr_ref = f"refs/merge-requests/{pr.pr_id}/head"
-        local_branch = f"mr-{pr.pr_id}"
+        if merge_base_result.returncode == 0:
+            base_ref = merge_base_result.stdout.strip()
+        else:
+            base_ref = f'origin/{pr.base_branch}'
 
-        subprocess.run(
-            ['git', 'fetch', 'origin', f"{pr_ref}:{local_branch}"],
-            cwd=repo_dir, env=env, check=True,
-            capture_output=quiet, timeout=120
-        )
+        # Checkout PR branch
+        try:
+            subprocess.run(
+                ['git', 'checkout', local_branch],
+                cwd=repo_dir, env=env, check=True,
+                capture_output=quiet
+            )
+        except subprocess.CalledProcessError as e:
+            shutil.rmtree(repo_dir, ignore_errors=True)
+            raise RuntimeError(f"Git checkout failed (exit {e.returncode}): {e.stderr.decode() if e.stderr else 'unknown error'}")
 
-    elif pr.platform == 'gitee':
-        # Gitee: refs/pull/{id}/head
-        pr_ref = f"refs/pull/{pr.pr_id}/head"
-        local_branch = f"pr-{pr.pr_id}"
+        if not quiet:
+            print(f"Repository ready at: {repo_dir}", file=sys.stderr)
+            print(f"Base ref: {base_ref}", file=sys.stderr)
+            print(f"Head ref: {local_branch}", file=sys.stderr)
 
-        subprocess.run(
-            ['git', 'fetch', 'origin', f"{pr_ref}:{local_branch}"],
-            cwd=repo_dir, env=env, check=True,
-            capture_output=quiet, timeout=120
-        )
+        return repo_dir, base_ref, local_branch
 
-    # Ensure we have enough history for merge-base
-    subprocess.run(
-        ['git', 'fetch', '--deepen=200', 'origin', pr.base_branch],
-        cwd=repo_dir, env=env,
-        capture_output=True, timeout=120
-    )
-
-    # Find merge base
-    merge_base_result = subprocess.run(
-        ['git', 'merge-base', f'origin/{pr.base_branch}', local_branch],
-        cwd=repo_dir, env=env,
-        capture_output=True, text=True
-    )
-
-    if merge_base_result.returncode == 0:
-        base_ref = merge_base_result.stdout.strip()
-    else:
-        base_ref = f'origin/{pr.base_branch}'
-
-    # Checkout PR branch
-    subprocess.run(
-        ['git', 'checkout', local_branch],
-        cwd=repo_dir, env=env, check=True,
-        capture_output=quiet
-    )
-
-    if not quiet:
-        print(f"Repository ready at: {repo_dir}", file=sys.stderr)
-        print(f"Base ref: {base_ref}", file=sys.stderr)
-        print(f"Head ref: {local_branch}", file=sys.stderr)
-
-    return repo_dir, base_ref, local_branch
+    finally:
+        # Clean up credential helper
+        if cred_helper_path:
+            try:
+                os.unlink(cred_helper_path)
+            except Exception:
+                pass
 
 
 def get_changed_files(repo_dir: Path, base_ref: str, head_ref: str) -> list[str]:
