@@ -135,6 +135,8 @@ Perform a thorough change review by:
    - For each changed file, view its diff: `git diff {base_ref} {head_ref} -- <file>`
    - If you need more context, read the full file or search for related code
    - Look for: security issues, logic errors, edge cases, error handling
+   - Treat assembly files (`.S`, `.s`, `.asm`) as source code and review ABI/calling convention,
+     register and stack preservation, memory addressing, bounds, and architecture guards
    - For non-code files (docs/config), focus on correctness and safety of the content
 
 3. **Track Dependencies**
@@ -147,6 +149,8 @@ Perform a thorough change review by:
    - Logic: null/nil checks, boundary conditions, error paths
    - API: breaking changes, compatibility, proper error returns
    - Resources: leaks, proper cleanup, race conditions
+   - Assembly: calling convention mismatches, save/restore bugs, bad clobbers,
+     stack alignment, incorrect addressing, missing feature/architecture guards
    - Documentation (Markdown/docs): incorrect or outdated instructions, wrong flags/paths,
      broken references, misleading examples, missing steps, or unsafe guidance
    - Config/build/CI: insecure defaults, mismatched versions, missing required keys
@@ -225,6 +229,8 @@ def categorize_files(files: list[str]) -> dict:
     }
 
     for f in files:
+        # Normalize case first so uppercase extensions such as `.S` are
+        # classified the same way as lowercase source files.
         f_lower = f.lower()
         if 'test' in f_lower or f_lower.endswith('_test.go') or f_lower.endswith('.test.js'):
             categories['test'].append(f)
@@ -232,7 +238,7 @@ def categorize_files(files: list[str]) -> dict:
             categories['docs'].append(f)
         elif f_lower.endswith(('.json', '.yaml', '.yml', '.toml', '.ini', '.cfg')):
             categories['config'].append(f)
-        elif f_lower.endswith(('.c', '.cpp', '.h', '.go', '.rs', '.py', '.js', '.ts', '.java', '.rb')):
+        elif f_lower.endswith(('.c', '.cpp', '.h', '.go', '.rs', '.py', '.js', '.ts', '.java', '.rb', '.s', '.asm')):
             categories['source'].append(f)
         else:
             categories['other'].append(f)
