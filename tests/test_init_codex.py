@@ -37,28 +37,24 @@ class InitCodexTests(unittest.TestCase):
 
 
 class CodexCommandTests(unittest.TestCase):
-    def test_build_codex_review_command_uses_base_ref_and_repo_dir(self):
-        repo_dir = Path("/tmp/repo")
+    def test_build_codex_command_bypasses_sandbox_by_default(self):
         cmd = run_review.build_codex_command(
-            repo_dir,
-            review_mode=True,
-            base_ref="origin/main"
-        )
-
-        self.assertEqual(cmd[:3], ["codex", "exec", "review"])
-        self.assertIn("--base", cmd)
-        self.assertIn("origin/main", cmd)
-        self.assertIn("--full-auto", cmd)
-        self.assertEqual(cmd[-3:], ["-C", str(repo_dir), "-"])
-
-    def test_build_codex_command_can_bypass_sandbox(self):
-        cmd = run_review.build_codex_command(
-            Path("/tmp/repo"),
-            bypass_sandbox=True
+            Path("/tmp/repo")
         )
 
         self.assertIn("--dangerously-bypass-approvals-and-sandbox", cmd)
         self.assertNotIn("--full-auto", cmd)
+        self.assertEqual(cmd[-1], "-")
+
+    def test_build_codex_command_can_use_sandbox(self):
+        cmd = run_review.build_codex_command(
+            Path("/tmp/repo"),
+            use_sandbox=True
+        )
+
+        self.assertIn("--full-auto", cmd)
+        self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", cmd)
+        self.assertEqual(cmd[-1], "-")
 
 
 class ReviewPromptTests(unittest.TestCase):
@@ -77,6 +73,41 @@ class ReviewPromptTests(unittest.TestCase):
         self.assertIn("Review ONLY the local repository checkout", prompt)
         self.assertIn("Do NOT search the web.", prompt)
         self.assertIn("Do NOT open GitHub, GitLab, Gitee, or GitCode pages", prompt)
+
+    def test_generate_review_prompt_mentions_assembly_review_rules(self):
+        prompt = run_review.generate_review_prompt({
+            "repo_dir": "workspace/repo",
+            "base_ref": "origin/main",
+            "head_ref": "HEAD",
+            "owner": "openHiTLS",
+            "repo": "openhitls",
+            "pr_id": "1153",
+            "changed_files": ["crypto/mldsa/src/asm/intt_armv8.S"],
+        })
+
+        self.assertIn("assembly files (`.S`, `.s`, `.asm`) as source code", prompt)
+        self.assertIn("calling convention mismatches", prompt)
+
+
+class FileCategorizationTests(unittest.TestCase):
+    def test_categorize_files_treats_assembly_as_source(self):
+        categories = run_review.categorize_files([
+            "crypto/mldsa/src/asm/intt_armv8.S",
+            "crypto/mldsa/src/asm/helper.s",
+            "crypto/mldsa/src/asm/dispatch.asm",
+            "docs/review-notes.md",
+        ])
+
+        self.assertEqual(
+            categories["source"],
+            [
+                "crypto/mldsa/src/asm/intt_armv8.S",
+                "crypto/mldsa/src/asm/helper.s",
+                "crypto/mldsa/src/asm/dispatch.asm",
+            ],
+        )
+        self.assertEqual(categories["docs"], ["docs/review-notes.md"])
+        self.assertEqual(categories["other"], [])
 
 
 if __name__ == "__main__":
