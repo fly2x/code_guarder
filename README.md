@@ -74,6 +74,9 @@ python3 scripts/run_review.py --context ./workspace/review_context.json --init -
 # Skip consolidation phase
 python3 scripts/run_review.py --context ./workspace/review_context.json --gemini --no-consolidate -o ./review-output
 
+# Use Codex's internal sandbox instead of the default bypass mode
+python3 scripts/run_review.py --context ./workspace/review_context.json --codex-use-sandbox -o ./review-output
+
 # Specify consolidation model (default: claude)
 python3 scripts/run_review.py --context ./workspace/review_context.json --gemini --consolidation-model gemini -o ./review-output
 ```
@@ -88,7 +91,7 @@ python3 scripts/run_review.py --context ./workspace/review_context.json --gemini
 | `--gemini`, `-g` | Enable Gemini CLI parallel review |
 | `--codex`, `-x` | Enable Codex CLI parallel review (default on) |
 | `--no-codex` | Disable Codex CLI review |
-| `--no-claude` | Disable Claude Code review |
+| `--codex-use-sandbox` | Run Codex with its internal sandbox instead of the default bypass mode |
 | `--init`, `-i` | Initialize AI tools before review |
 | `--no-consolidate` | Skip consolidation phase |
 | `--consolidation-model` | AI model for consolidation phase: claude, gemini, or codex (default: claude) |
@@ -242,9 +245,9 @@ FIX:
 |------|---------------|----------------|
 | Claude | `claude -p --output-format text --dangerously-skip-permissions` | `--dangerously-skip-permissions` |
 | Gemini | `gemini -y` | `-y` (YOLO mode) |
-| Codex | `codex exec --full-auto -` | `--full-auto` |
+| Codex | `codex exec --dangerously-bypass-approvals-and-sandbox -` | `--dangerously-bypass-approvals-and-sandbox` |
 
-**Note**: `-` in Codex command means read prompt from stdin. All tools receive prompts via stdin.
+**Note**: `-` in Codex command means read prompt from stdin. All tools receive prompts via stdin. Codex now bypasses its internal sandbox by default; pass `--codex-use-sandbox` to restore the older `--full-auto` mode. The review flow is constrained to the local checkout and should not need remote PR pages or web search.
 
 ## Timeouts
 

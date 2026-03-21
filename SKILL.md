@@ -43,7 +43,7 @@ PR URL → fetch_pr.py --clone → repo + context.json
         ┌───────────────────────────┼───────────────────────────┐
         ↓                           ↓                           ↓
    Claude Code                 Gemini CLI                  Codex CLI
-   (default)                   (--gemini)                  (--codex)
+   (--claude)                  (--gemini)                  (default)
         ↓                           ↓                           ↓
    claude_review              gemini_review              codex_review
         └───────────────────────────┼───────────────────────────┘
@@ -67,17 +67,17 @@ python3 scripts/fetch_pr.py "PR_URL" --clone -o ./workspace
 ### Run Review
 
 ```bash
-# Claude only (default)
+# Codex only (default)
 python3 scripts/run_review.py -c ./workspace/review_context.json -o ./output
 
-# Claude + Gemini
+# Codex + Gemini
 python3 scripts/run_review.py -c ./workspace/review_context.json --gemini -o ./output
 
 # All three AIs
-python3 scripts/run_review.py -c ./workspace/review_context.json --gemini --codex -o ./output
+python3 scripts/run_review.py -c ./workspace/review_context.json --claude --gemini -o ./output
 
 # With AI tool initialization
-python3 scripts/run_review.py -c ./workspace/review_context.json --init --gemini -o ./output
+python3 scripts/run_review.py -c ./workspace/review_context.json --init --claude --gemini -o ./output
 ```
 
 ### Options
@@ -87,9 +87,9 @@ python3 scripts/run_review.py -c ./workspace/review_context.json --init --gemini
 | `-c, --context` | Context JSON from fetch_pr.py |
 | `-o, --output` | Output directory |
 | `-g, --gemini` | Enable Gemini parallel review |
-| `-x, --codex` | Enable Codex parallel review |
+| `-x, --codex` | Explicitly enable Codex parallel review (default on) |
+| `--codex-use-sandbox` | Run Codex with its internal sandbox instead of the default bypass mode |
 | `-i, --init` | Initialize AI tools (CLAUDE.md, GEMINI.md, AGENTS.md) |
-| `--no-claude` | Disable Claude |
 | `--no-consolidate` | Skip consolidation phase |
 
 ## Supported Platforms
@@ -170,9 +170,9 @@ npm install -g @openai/codex
 
 | Tool | Command | Auto Mode |
 |------|---------|-----------|
-| Claude | `claude -p --output-format text` | `--dangerously-skip-permissions` |
-| Gemini | `gemini` | `-y` |
-| Codex | `codex exec - ` | `--full-auto` |
+| Claude | `claude -p --output-format text --dangerously-skip-permissions` | `--dangerously-skip-permissions` |
+| Gemini | `gemini -y` | `-y` |
+| Codex | `codex exec --dangerously-bypass-approvals-and-sandbox -` | `--dangerously-bypass-approvals-and-sandbox` |
 
 - Initialization runs in **parallel** for all enabled tools
 - Init timeout: 10 min, Review timeout: 30 min

@@ -92,6 +92,7 @@ def generate_review_prompt(context: dict, reviewer: str = 'codex') -> str:
     pr_id = context.get('pr_id', '')
     owner = context.get('owner', '')
     repo = context.get('repo', '')
+    repo_dir = context.get('repo_dir', '.')
 
     # Categorize files
     file_categories = categorize_files(changed_files)
@@ -101,9 +102,26 @@ def generate_review_prompt(context: dict, reviewer: str = 'codex') -> str:
 You are reviewing PR #{pr_id} for {owner}/{repo}.
 {f'**Title**: {title}' if title else ''}
 
+## Local Repository Context
+
+- Repository root: `{repo_dir}`
+- Base ref: `{base_ref}`
+- Head ref: `{head_ref}`
+- The change under review is already checked out locally in this repository.
+
 ## Changed Files ({len(changed_files)} files)
 
 {format_file_categories(file_categories)}
+
+## Hard Constraints
+
+- Review ONLY the local repository checkout in the current working directory.
+- Use local git/file inspection only.
+- Do NOT search the web.
+- Do NOT open GitHub, GitLab, Gitee, or GitCode pages for this review.
+- Do NOT rely on remote PR pages or web search results for code analysis.
+- If a git command fails, retry with another local command or inspect the changed files directly.
+- If local tooling is limited, continue from the checked-out files and changed-file list instead of switching to network search.
 
 ## Your Task
 
@@ -169,6 +187,31 @@ FIX:
 Start the review now. Output each issue as you find it.
 """
     return prompt
+
+
+def build_codex_command(
+    repo_dir: Path,
+    *,
+    use_sandbox: bool = False
+) -> list[str]:
+    """Build a Codex CLI command for this repository."""
+    command = ['codex', 'exec']
+
+    # Default to bypass mode because some local environments break Codex's
+    # internal sandbox. Callers can opt back into the sandbox explicitly.
+    if use_sandbox:
+        command.append('--full-auto')
+    else:
+        command.append('--dangerously-bypass-approvals-and-sandbox')
+
+    # The caller already launches Codex with cwd=repo_dir.
+    #
+    # We intentionally use plain `codex exec` instead of `codex exec review`
+    # because current Codex CLI versions reject `--base`/custom prompt
+    # combinations, while this project relies on a structured stdin prompt
+    # that tells Codex which local git diff to inspect.
+    command.append('-')
+    return command
 
 
 def categorize_files(files: list[str]) -> dict:
@@ -311,11 +354,12 @@ Now analyze the current directory structure and source files, then write CLAUDE.
         return False
 
 
-def init_codex(repo_dir: Path) -> bool:
+def init_codex(repo_dir: Path, use_sandbox: bool = False) -> bool:
     """Initialize Codex context by generating AGENTS.md if not exists.
 
     Note: Codex CLI's /init slash command only works in interactive TUI mode.
-    In non-interactive mode (codex exec), we use a prompt to generate AGENTS.md.
+    In non-interactive mode (codex exec), we ask Codex to output AGENTS.md content
+    and let the CLI write the final response to disk via --output-last-message.
     See: https://github.com/openai/codex/issues/4219
     """
     agents_md = repo_dir / "AGENTS.md"
@@ -328,9 +372,9 @@ def init_codex(repo_dir: Path) -> bool:
 
     print_step("Initializing Codex context (generating AGENTS.md)...")
 
-    # Codex exec doesn't support /init slash command - use prompt instead
-    # AGENTS.md defines how Codex should behave in this repository
-    init_prompt = """Analyze this codebase and create an AGENTS.md file in the project root.
+    # Codex exec doesn't support /init slash command - use prompt instead.
+    # Ask for raw AGENTS.md contents and have the CLI persist the final message.
+    init_prompt = """Analyze this codebase and draft the contents of AGENTS.md for the project root.
 
 AGENTS.md is a configuration file that tells Codex how to behave in this repository.
 
@@ -363,23 +407,35 @@ List of key files to understand the codebase.
 
 ---
 
-Now analyze the current directory structure and source files, then write AGENTS.md with the above sections filled in based on what you discover. Keep it concise but informative.
+Now analyze the current directory structure and source files, then produce the complete AGENTS.md contents with the above sections filled in based on what you discover.
+
+Output rules:
+- Output raw AGENTS.md markdown only
+- Do not wrap the file in code fences
+- Do not add commentary before or after the file
+- Keep it concise but informative
 """
 
     try:
+        command = build_codex_command(repo_dir, use_sandbox=use_sandbox)
+        command[-1:-1] = ['--output-last-message', str(agents_md)]
         proc = subprocess.run(
-            ['codex', 'exec', '--full-auto', '-'],
+            command,
             input=init_prompt,
             capture_output=True,
             text=True,
             cwd=repo_dir,
             timeout=600
         )
-        if agents_md.exists():
+        if agents_md.exists() and agents_md.stat().st_size > 0:
             print_success("AGENTS.md generated")
             return True
         else:
-            print_warning("AGENTS.md was not generated (Codex exec may not support file writes in sandbox mode)")
+            print_warning("AGENTS.md was not generated")
+            if proc.stdout:
+                print_warning(f"stdout: {proc.stdout[:500]}")
+            if proc.stderr:
+                print_warning(f"stderr: {proc.stderr[:500]}")
             return False
     except Exception as e:
         print_warning(f"Codex init failed: {e}")
@@ -464,7 +520,13 @@ Now analyze the current directory structure and source files, then write GEMINI.
         return False
 
 
-def init_ai_tools(repo_dir: Path, use_claude: bool, use_gemini: bool, use_codex: bool) -> None:
+def init_ai_tools(
+    repo_dir: Path,
+    use_claude: bool,
+    use_gemini: bool,
+    use_codex: bool,
+    codex_use_sandbox: bool = False
+) -> None:
     """Initialize all enabled AI tools in parallel."""
     print_header("Initializing AI Tools")
 
@@ -474,7 +536,7 @@ def init_ai_tools(repo_dir: Path, use_claude: bool, use_gemini: bool, use_codex:
     if use_gemini:
         init_tasks.append(('gemini', init_gemini))
     if use_codex:
-        init_tasks.append(('codex', init_codex))
+        init_tasks.append(('codex', lambda repo_dir: init_codex(repo_dir, use_sandbox=codex_use_sandbox)))
 
     if not init_tasks:
         return
@@ -656,12 +718,37 @@ def run_gemini_agent(repo_dir: Path, prompt: str, output_file: Path) -> tuple[Pa
     return run_agent_generic(repo_dir, prompt, output_file, config)
 
 
-def run_codex_agent(repo_dir: Path, prompt: str, output_file: Path) -> tuple[Path, list[str]]:
-    """Run Codex CLI agent with real-time output streaming."""
+def run_codex_agent(
+    repo_dir: Path,
+    prompt: str,
+    output_file: Path,
+    use_sandbox: bool = False
+) -> tuple[Path, list[str]]:
+    """Run generic Codex CLI agent with real-time output streaming."""
 
     config = AgentConfig(
         name='Codex',
-        command=['codex', 'exec', '--full-auto', '-'],
+        command=build_codex_command(repo_dir, use_sandbox=use_sandbox),
+        color=Colors.CODEX,
+        cli_name='codex',
+        not_found_msg="Codex CLI not found",
+        timeout=1800
+    )
+
+    return run_agent_generic(repo_dir, prompt, output_file, config)
+
+
+def run_codex_review_agent(
+    repo_dir: Path,
+    prompt: str,
+    output_file: Path,
+    use_sandbox: bool = False
+) -> tuple[Path, list[str]]:
+    """Run Codex CLI for review using the project-specific stdin prompt."""
+
+    config = AgentConfig(
+        name='Codex',
+        command=build_codex_command(repo_dir, use_sandbox=use_sandbox),
         color=Colors.CODEX,
         cli_name='codex',
         not_found_msg="Codex CLI not found",
@@ -946,7 +1033,14 @@ Start consolidation now. Output each validated issue in the required format.
     return prompt
 
 
-def run_consolidation(repo_dir: Path, review_reports: dict[str, Path], context: dict, output_dir: Path, consolidation_model: str = 'claude') -> Path:
+def run_consolidation(
+    repo_dir: Path,
+    review_reports: dict[str, Path],
+    context: dict,
+    output_dir: Path,
+    consolidation_model: str = 'claude',
+    codex_use_sandbox: bool = False
+) -> Path:
     """Run AI CLI to consolidate all review reports.
 
     Args:
@@ -969,9 +1063,11 @@ def run_consolidation(repo_dir: Path, review_reports: dict[str, Path], context: 
 
     # Run consolidation with the specified model
     agent_map = {
-        'claude': ('Claude Code', run_claude_agent),
-        'gemini': ('Gemini CLI', run_gemini_agent),
-        'codex': ('Codex CLI', run_codex_agent),
+        'claude': ('Claude Code', lambda repo_dir, prompt, output_file: run_claude_agent(repo_dir, prompt, output_file)),
+        'gemini': ('Gemini CLI', lambda repo_dir, prompt, output_file: run_gemini_agent(repo_dir, prompt, output_file)),
+        'codex': ('Codex CLI', lambda repo_dir, prompt, output_file: run_codex_agent(
+            repo_dir, prompt, output_file, use_sandbox=codex_use_sandbox
+        )),
     }
 
     if consolidation_model not in agent_map:
@@ -1306,7 +1402,8 @@ def run_parallel_reviews(
     output_dir: Path,
     use_claude: bool = True,
     use_gemini: bool = False,
-    use_codex: bool = False
+    use_codex: bool = False,
+    codex_use_sandbox: bool = False
 ) -> dict[str, Path]:
     """Run multiple AI reviews in parallel."""
 
@@ -1338,7 +1435,12 @@ def run_parallel_reviews(
         elif reviewer == 'gemini':
             result_file, _ = run_gemini_agent(repo_dir, prompt, output_file)
         elif reviewer == 'codex':
-            result_file, _ = run_codex_agent(repo_dir, prompt, output_file)
+            result_file, _ = run_codex_review_agent(
+                repo_dir,
+                prompt,
+                output_file,
+                use_sandbox=codex_use_sandbox
+            )
         else:
             return reviewer, None, []
 
@@ -1416,8 +1518,9 @@ AI Tool Context Files:
                         help="Explicitly enable Codex CLI review (default on)")
     parser.add_argument("--no-codex", action="store_true",
                         help="Disable Codex CLI review")
-    parser.add_argument("--no-claude", action="store_true",
-                        help="Disable Claude Code (use with --gemini or --codex)")
+    parser.add_argument("--codex-use-sandbox", action="store_true",
+                        help="Run Codex with its internal sandbox instead of the default bypass mode")
+    parser.add_argument("--codex-bypass-sandbox", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--no-consolidate", action="store_true",
                         help="Skip consolidation phase (keep individual reports only)")
     parser.add_argument("--init", "-i", action="store_true",
@@ -1435,9 +1538,11 @@ AI Tool Context Files:
     # Validate: at least one reviewer must be enabled
     use_gemini = args.gemini
 
-    if args.claude and args.no_claude:
-        print_error("Conflicting flags: --claude and --no-claude")
+    if args.codex_use_sandbox and args.codex_bypass_sandbox:
+        print_error("Conflicting flags: --codex-use-sandbox and --codex-bypass-sandbox")
         sys.exit(1)
+    if args.codex_bypass_sandbox:
+        print_warning("--codex-bypass-sandbox is deprecated; bypass mode is now the default")
     use_claude = args.claude
 
     if args.codex and args.no_codex:
@@ -1504,7 +1609,13 @@ AI Tool Context Files:
 
     # Initialize AI tools if requested
     if args.init:
-        init_ai_tools(repo_dir, use_claude, use_gemini, use_codex)
+        init_ai_tools(
+            repo_dir,
+            use_claude,
+            use_gemini,
+            use_codex,
+            codex_use_sandbox=args.codex_use_sandbox
+        )
 
     # Phase 1: Run parallel reviews
     review_reports, all_issues = run_parallel_reviews(
@@ -1513,7 +1624,8 @@ AI Tool Context Files:
         output_dir=args.output,
         use_claude=use_claude,
         use_gemini=use_gemini,
-        use_codex=use_codex
+        use_codex=use_codex,
+        codex_use_sandbox=args.codex_use_sandbox
     )
 
     active_reviewers = [r for r in ['claude', 'gemini', 'codex']
@@ -1526,7 +1638,14 @@ AI Tool Context Files:
 
     if len(review_reports) > 1 and not args.no_consolidate:
         # Run consolidation with specified model (default: claude)
-        consolidation_output = run_consolidation(repo_dir, review_reports, context, args.output, args.consolidation_model)
+        consolidation_output = run_consolidation(
+            repo_dir,
+            review_reports,
+            context,
+            args.output,
+            args.consolidation_model,
+            codex_use_sandbox=args.codex_use_sandbox
+        )
 
         consolidated_issues = []
         if consolidation_output.exists() and consolidation_output.stat().st_size > 0:
