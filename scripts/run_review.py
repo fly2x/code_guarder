@@ -117,9 +117,6 @@ You are reviewing PR #{pr_id} for {owner}/{repo}.
 
 - Review ONLY the local repository checkout in the current working directory.
 - Use local git/file inspection only.
-- Do NOT search the web.
-- Do NOT open GitHub, GitLab, Gitee, or GitCode pages for this review.
-- Do NOT rely on remote PR pages or web search results for code analysis.
 - If a git command fails, retry with another local command or inspect the changed files directly.
 - If local tooling is limited, continue from the checked-out files and changed-file list instead of switching to network search.
 
