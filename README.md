@@ -15,14 +15,8 @@ Multi-AI collaborative code review system. Uses Claude Code, Gemini CLI, and Cod
 ## Quick Start
 
 ```bash
-# 1. Clone PR and prepare workspace
-python3 scripts/fetch_pr.py "https://github.com/owner/repo/pull/123" --clone -o ./workspace
-
-# 2. Run multi-AI review (Codex + Gemini)
-python3 scripts/run_review.py --context ./workspace/review_context.json --gemini -o ./review-output
-
-# 3. View final report
-open ./review-output/final_report.html
+# Start review with Codex by default
+python3 scripts/run_review.py "https://github.com/owner/repo/pull/123" -o ./review-output
 ```
 
 ## Installation
@@ -59,6 +53,18 @@ python3 scripts/fetch_pr.py "https://github.com/owner/repo/pull/123" --clone -o 
 # Codex only (default)
 python3 scripts/run_review.py --context ./workspace/review_context.json -o ./review-output
 
+# Gemini only
+python3 scripts/run_review.py --context ./workspace/review_context.json --review-model gemini -o ./review-output
+
+# Claude only
+python3 scripts/run_review.py --context ./workspace/review_context.json --review-model claude -o ./review-output
+
+# Gemini as primary reviewer, plus Claude in parallel
+python3 scripts/run_review.py --context ./workspace/review_context.json --review-model gemini --claude -o ./review-output
+
+# Gemini as primary reviewer, plus Claude and Codex in parallel
+python3 scripts/run_review.py --context ./workspace/review_context.json --review-model gemini --claude --codex -o ./review-output
+
 # Codex + Claude in parallel
 python3 scripts/run_review.py --context ./workspace/review_context.json --claude -o ./review-output
 
@@ -81,16 +87,25 @@ python3 scripts/run_review.py --context ./workspace/review_context.json --codex-
 python3 scripts/run_review.py --context ./workspace/review_context.json --gemini --consolidation-model gemini -o ./review-output
 ```
 
+### Reviewer Selection Rules
+
+- `--review-model` sets the primary reviewer. The default is `codex`.
+- `--claude` and `--gemini` add parallel reviewers.
+- If the primary reviewer is `gemini` or `claude`, Codex is not included automatically.
+- To include Codex together with another primary reviewer, add `--codex` explicitly.
+- `--no-codex` removes Codex from the reviewer set and cannot be used when `--review-model codex` is selected.
+
 ### Command Line Options
 
 | Option | Description |
 |--------|-------------|
 | `--context`, `-c` | Review context JSON file (from fetch_pr.py --clone) |
 | `--output`, `-o` | Output directory (default: ./review-output) |
-| `--claude` | Enable Claude Code parallel review |
-| `--gemini`, `-g` | Enable Gemini CLI parallel review |
-| `--codex`, `-x` | Enable Codex CLI parallel review (default on) |
-| `--no-codex` | Disable Codex CLI review |
+| `--review-model` | Primary review model: `codex`, `claude`, or `gemini` (default: `codex`) |
+| `--claude` | Add Claude Code as a parallel reviewer |
+| `--gemini`, `-g` | Add Gemini CLI as a parallel reviewer |
+| `--codex`, `-x` | Add Codex as a parallel reviewer when it is not already the primary reviewer |
+| `--no-codex` | Remove Codex from the reviewer set |
 | `--codex-use-sandbox` | Run Codex with its internal sandbox instead of the default bypass mode |
 | `--init`, `-i` | Initialize AI tools before review |
 | `--no-consolidate` | Skip consolidation phase |
@@ -110,7 +125,7 @@ PR URL --> fetch_pr.py --clone --> cloned repo + context.json
                    +---------------------+---------------------+
                    |                     |                     |
              Codex CLI             Claude Code            Gemini CLI
-             (default)              (--claude)            (--gemini)
+          (--review-model)      (--review-model)       (--review-model)
                    |                     |                     |
              codex_review           claude_review        gemini_review
              .md/.html/.json        .md/.html/.json       .md/.html/.json

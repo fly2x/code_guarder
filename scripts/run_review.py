@@ -19,6 +19,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional, Callable
 
+try:
+    from scripts import fetch_pr as fetch_pr_module
+except ImportError:
+    import fetch_pr as fetch_pr_module
+
 
 @dataclass
 class AgentConfig:
@@ -78,6 +83,9 @@ def print_warning(msg: str):
     print(f"{Colors.WARNING}⚠ {msg}{Colors.RESET}", file=sys.stderr)
 
 
+SUPPORTED_REVIEWERS = ('codex', 'claude', 'gemini')
+
+
 # =============================================================================
 # Review Prompt Generation
 # =============================================================================
@@ -117,6 +125,8 @@ You are reviewing PR #{pr_id} for {owner}/{repo}.
 
 - Review ONLY the local repository checkout in the current working directory.
 - Use local git/file inspection only.
+- Do NOT search the web.
+- Do NOT open GitHub, GitLab, Gitee, or GitCode pages.
 - If a git command fails, retry with another local command or inspect the changed files directly.
 - If local tooling is limited, continue from the checked-out files and changed-file list instead of switching to network search.
 
@@ -259,6 +269,88 @@ def format_file_categories(categories: dict) -> str:
             lines.append("")
 
     return '\n'.join(lines)
+
+
+def is_pr_url(value: str) -> bool:
+    """Return True when the input string looks like a supported PR/MR URL."""
+    return fetch_pr_module.parse_pr_url(value) is not None
+
+
+def create_workspace_dir(workspace_root: Path, pr_info) -> Path:
+    """Create a unique workspace directory for a PR review run."""
+    slug = f"{pr_info.owner}-{pr_info.repo}-pr-{pr_info.pr_id}"
+    workspace_dir = workspace_root / slug
+    if not workspace_dir.exists():
+        return workspace_dir
+
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    return workspace_root / f"{slug}-{timestamp}"
+
+
+def prepare_pr_review_context(
+    pr_url: str,
+    workspace_root: Path,
+    *,
+    quiet: bool = False
+) -> tuple[Path, dict, Path]:
+    """Clone a PR/MR locally and generate review context files."""
+    pr_info = fetch_pr_module.parse_pr_url(pr_url)
+    if not pr_info:
+        raise ValueError(f"Unsupported PR/MR URL: {pr_url}")
+
+    pr_info = fetch_pr_module.fetch_pr_metadata(pr_info)
+    workspace_dir = create_workspace_dir(workspace_root, pr_info)
+    workspace_dir.mkdir(parents=True, exist_ok=True)
+
+    repo_dir, base_ref, head_ref = fetch_pr_module.clone_pr_repo(pr_info, workspace_dir, quiet)
+    changed_files = fetch_pr_module.get_changed_files(repo_dir, base_ref, head_ref)
+    diff_stats = fetch_pr_module.get_diff_stats(repo_dir, base_ref, head_ref)
+
+    context = {
+        **pr_info.to_dict(),
+        'repo_dir': str(repo_dir),
+        'base_ref': base_ref,
+        'head_ref': head_ref,
+        'changed_files': changed_files,
+        'changed_files_count': len(changed_files),
+    }
+
+    context_file = workspace_dir / "review_context.json"
+    context_file.write_text(json.dumps(context, indent=2, ensure_ascii=False))
+    (workspace_dir / "diff_stats.txt").write_text(diff_stats)
+    (workspace_dir / "changed_files.txt").write_text('\n'.join(changed_files))
+
+    return repo_dir, context, context_file
+
+
+def resolve_reviewer_selection(
+    primary_reviewer: str = 'codex',
+    *,
+    enable_claude: bool = False,
+    enable_gemini: bool = False,
+    enable_codex: bool = False,
+    disable_codex: bool = False
+) -> dict[str, bool]:
+    """Resolve the active reviewer set from CLI options."""
+    reviewers = {primary_reviewer}
+
+    if enable_claude:
+        reviewers.add('claude')
+    if enable_gemini:
+        reviewers.add('gemini')
+    if enable_codex:
+        reviewers.add('codex')
+
+    if disable_codex:
+        if primary_reviewer == 'codex':
+            raise ValueError("Primary reviewer is codex but Codex review is disabled")
+        reviewers.discard('codex')
+
+    resolved = {reviewer: reviewer in reviewers for reviewer in SUPPORTED_REVIEWERS}
+    if not any(resolved.values()):
+        raise ValueError("At least one reviewer must be enabled")
+
+    return resolved
 
 
 # =============================================================================
@@ -1403,9 +1495,9 @@ def run_parallel_reviews(
     repo_dir: Path,
     context: dict,
     output_dir: Path,
-    use_claude: bool = True,
+    use_claude: bool = False,
     use_gemini: bool = False,
-    use_codex: bool = False,
+    use_codex: bool = True,
     codex_use_sandbox: bool = False
 ) -> dict[str, Path]:
     """Run multiple AI reviews in parallel."""
@@ -1486,6 +1578,12 @@ Examples:
   # Codex only (default)
   %(prog)s ./repo --output ./review-output
 
+  # Review a PR URL directly with Codex
+  %(prog)s https://github.com/owner/repo/pull/123 --output ./review-output
+
+  # Review a PR URL with Gemini instead of Codex
+  %(prog)s https://github.com/owner/repo/pull/123 --review-model gemini --output ./review-output
+
   # Initialize AI tools before review (generates CLAUDE.md, AGENTS.md, GEMINI.md)
   %(prog)s ./repo --init --gemini --claude --output ./review-output
 
@@ -1507,12 +1605,17 @@ AI Tool Context Files:
   - Gemini CLI:  GEMINI.md (project context, persona)
         """
     )
-    parser.add_argument("repo_dir", type=Path, nargs='?',
-                        help="Repository directory to review")
+    parser.add_argument("target", nargs='?',
+                        help="Repository directory or PR/MR URL to review")
     parser.add_argument("--context", "-c", type=Path,
                         help="Review context JSON file (from fetch_pr.py --clone)")
+    parser.add_argument("--workspace", type=Path, default=Path("./workspace"),
+                        help="Workspace root for PR URL mode (default: ./workspace)")
     parser.add_argument("--output", "-o", type=Path, default=Path("./review-output"),
                         help="Output directory for reports")
+    parser.add_argument("--review-model", type=str, default='codex',
+                        choices=list(SUPPORTED_REVIEWERS),
+                        help="Primary review model to run by default: codex, claude, or gemini (default: codex)")
     parser.add_argument("--gemini", "-g", action="store_true",
                         help="Also run Gemini CLI review in parallel")
     parser.add_argument("--claude", action="store_true",
@@ -1538,24 +1641,31 @@ AI Tool Context Files:
 
     args = parser.parse_args()
 
-    # Validate: at least one reviewer must be enabled
-    use_gemini = args.gemini
-
     if args.codex_use_sandbox and args.codex_bypass_sandbox:
         print_error("Conflicting flags: --codex-use-sandbox and --codex-bypass-sandbox")
         sys.exit(1)
     if args.codex_bypass_sandbox:
         print_warning("--codex-bypass-sandbox is deprecated; bypass mode is now the default")
-    use_claude = args.claude
 
     if args.codex and args.no_codex:
         print_error("Conflicting flags: --codex and --no-codex")
         sys.exit(1)
-    use_codex = not args.no_codex  # Default ON
 
-    if not use_claude and not use_gemini and not use_codex:
-        print_error("At least one reviewer must be enabled. Remove --no-codex or add --gemini/--claude")
+    try:
+        reviewer_selection = resolve_reviewer_selection(
+            args.review_model,
+            enable_claude=args.claude,
+            enable_gemini=args.gemini,
+            enable_codex=args.codex,
+            disable_codex=args.no_codex,
+        )
+    except ValueError as exc:
+        print_error(str(exc))
         sys.exit(1)
+
+    use_codex = reviewer_selection['codex']
+    use_claude = reviewer_selection['claude']
+    use_gemini = reviewer_selection['gemini']
 
     print_header("Multi-AI Code Review")
 
@@ -1570,14 +1680,27 @@ AI Tool Context Files:
             # If relative path, resolve relative to current working directory
             if not repo_dir.is_absolute():
                 repo_dir = Path.cwd() / repo_dir
-        elif args.repo_dir:
-            repo_dir = args.repo_dir
+        elif args.target and not is_pr_url(args.target):
+            repo_dir = Path(args.target)
         else:
             # Default to parent directory of context file
             repo_dir = args.context.parent / 'repo'
         print_step(f"Repository: {repo_dir}")
-    elif args.repo_dir:
-        repo_dir = args.repo_dir
+    elif args.target and is_pr_url(args.target):
+        print_step(f"Preparing review workspace from PR URL: {args.target}")
+        try:
+            repo_dir, context, context_file = prepare_pr_review_context(
+                args.target,
+                args.workspace,
+            )
+        except Exception as e:
+            print_error(f"Failed to prepare PR workspace: {e}")
+            sys.exit(1)
+
+        print_step(f"Repository: {repo_dir}")
+        print_step(f"Context saved to {context_file}")
+    elif args.target:
+        repo_dir = Path(args.target)
         print_step(f"Generating context from {repo_dir}")
 
         base_ref = args.base_ref
@@ -1600,7 +1723,7 @@ AI Tool Context Files:
             'pr_id': 'local',
         }
     else:
-        print_error("Please provide either --context or repo_dir")
+        print_error("Please provide either --context, a repository path, or a PR/MR URL")
         sys.exit(1)
 
     if not repo_dir.exists():
@@ -1631,10 +1754,7 @@ AI Tool Context Files:
         codex_use_sandbox=args.codex_use_sandbox
     )
 
-    active_reviewers = [r for r in ['claude', 'gemini', 'codex']
-                        if (r == 'claude' and use_claude) or
-                           (r == 'gemini' and use_gemini) or
-                           (r == 'codex' and use_codex)]
+    active_reviewers = [reviewer for reviewer in SUPPORTED_REVIEWERS if reviewer_selection[reviewer]]
 
     # Phase 2: Consolidation (if multiple reviewers or explicitly requested)
     total_issues = sum(len(issues) for issues in all_issues.values())

@@ -57,6 +57,36 @@ class CodexCommandTests(unittest.TestCase):
         self.assertEqual(cmd[-1], "-")
 
 
+class ReviewerSelectionTests(unittest.TestCase):
+    def test_resolve_reviewer_selection_defaults_to_codex(self):
+        selection = run_review.resolve_reviewer_selection()
+
+        self.assertEqual(
+            selection,
+            {"codex": True, "claude": False, "gemini": False},
+        )
+
+    def test_resolve_reviewer_selection_can_switch_primary_model(self):
+        selection = run_review.resolve_reviewer_selection("gemini")
+
+        self.assertEqual(
+            selection,
+            {"codex": False, "claude": False, "gemini": True},
+        )
+
+    def test_resolve_reviewer_selection_can_add_parallel_reviewers(self):
+        selection = run_review.resolve_reviewer_selection("gemini", enable_claude=True)
+
+        self.assertEqual(
+            selection,
+            {"codex": False, "claude": True, "gemini": True},
+        )
+
+    def test_resolve_reviewer_selection_rejects_disabling_primary_codex(self):
+        with self.assertRaises(ValueError):
+            run_review.resolve_reviewer_selection("codex", disable_codex=True)
+
+
 class ReviewPromptTests(unittest.TestCase):
     def test_generate_review_prompt_enforces_local_only_review(self):
         prompt = run_review.generate_review_prompt({
@@ -108,6 +138,65 @@ class FileCategorizationTests(unittest.TestCase):
         )
         self.assertEqual(categories["docs"], ["docs/review-notes.md"])
         self.assertEqual(categories["other"], [])
+
+
+class PrUrlWorkflowTests(unittest.TestCase):
+    def test_is_pr_url_detects_supported_review_links(self):
+        self.assertTrue(run_review.is_pr_url("https://github.com/acme/api/pull/123"))
+        self.assertTrue(run_review.is_pr_url("https://gitlab.com/acme/api/-/merge_requests/456"))
+        self.assertFalse(run_review.is_pr_url("/tmp/local-repo"))
+
+    def test_create_workspace_dir_adds_timestamp_on_collision(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace_root = Path(tmpdir)
+            existing = workspace_root / "acme-api-pr-123"
+            existing.mkdir()
+
+            pr_info = run_review.fetch_pr_module.PRInfo(
+                platform="github",
+                owner="acme",
+                repo="api",
+                pr_id="123",
+                url="https://github.com/acme/api/pull/123",
+            )
+
+            workspace_dir = run_review.create_workspace_dir(workspace_root, pr_info)
+
+            self.assertNotEqual(workspace_dir, existing)
+            self.assertTrue(workspace_dir.name.startswith("acme-api-pr-123-"))
+
+    def test_prepare_pr_review_context_writes_context_files(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace_root = Path(tmpdir)
+            repo_dir = workspace_root / "acme-api-pr-123" / "api"
+            repo_dir.mkdir(parents=True)
+
+            pr_info = run_review.fetch_pr_module.PRInfo(
+                platform="github",
+                owner="acme",
+                repo="api",
+                pr_id="123",
+                url="https://github.com/acme/api/pull/123",
+                title="Fix auth",
+            )
+
+            with patch.object(run_review.fetch_pr_module, "parse_pr_url", return_value=pr_info):
+                with patch.object(run_review.fetch_pr_module, "fetch_pr_metadata", return_value=pr_info):
+                    with patch.object(run_review.fetch_pr_module, "clone_pr_repo", return_value=(repo_dir, "origin/main", "pr-123")):
+                        with patch.object(run_review.fetch_pr_module, "get_changed_files", return_value=["src/auth.py"]):
+                            with patch.object(run_review.fetch_pr_module, "get_diff_stats", return_value=" src/auth.py | 2 +-\n"):
+                                resolved_repo_dir, context, context_file = run_review.prepare_pr_review_context(
+                                    pr_info.url,
+                                    workspace_root,
+                                    quiet=True,
+                                )
+
+            self.assertEqual(resolved_repo_dir, repo_dir)
+            self.assertEqual(context["repo_dir"], str(repo_dir))
+            self.assertEqual(context["changed_files"], ["src/auth.py"])
+            self.assertTrue(context_file.exists())
+            self.assertTrue((context_file.parent / "diff_stats.txt").exists())
+            self.assertTrue((context_file.parent / "changed_files.txt").exists())
 
 
 if __name__ == "__main__":
