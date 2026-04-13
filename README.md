@@ -97,6 +97,33 @@ python3 scripts/run_review.py --context ./workspace/review_context.json --gemini
 | `--consolidation-model` | AI model for consolidation phase: claude, gemini, or codex (default: claude) |
 | `--base-ref` | Base ref for diff (default: origin/main) |
 | `--head-ref` | Head ref for diff (default: HEAD) |
+| `--custom-rules` | Custom review rules text to inject into the review prompt |
+| `--custom-rules-file` | Path to a markdown file containing custom review rules |
+
+### Custom Review Rules
+
+Inject project-specific review rules into the AI review prompt. Rules are stacked (all sources merge):
+
+| Priority | Source | Description |
+|----------|--------|-------------|
+| Highest | `--custom-rules "text"` | CLI inline rules (CI/CD overrides) |
+| Medium | `--custom-rules-file path` | External rules file (team-shared) |
+| Lowest | `.code-guarder/review-rules.md` | Project-local rules (committed to repo) |
+
+```bash
+# Inline rules
+python3 scripts/run_review.py --context ./workspace/review_context.json \
+    --custom-rules "All crypto ops must use constant-time comparison" -o ./review-output
+
+# Rules from file
+python3 scripts/run_review.py --context ./workspace/review_context.json \
+    --custom-rules-file ./team-rules/crypto-review.md -o ./review-output
+
+# Auto-detect project rules (place .code-guarder/review-rules.md in the reviewed repo)
+python3 scripts/run_review.py --context ./workspace/review_context.json -o ./review-output
+```
+
+See [`.code-guarder/review-rules.example.md`](.code-guarder/review-rules.example.md) for a template.
 
 ## Architecture
 
@@ -243,11 +270,11 @@ FIX:
 
 | Tool | Review Command | Auto Mode Flag |
 |------|---------------|----------------|
-| Claude | `claude -p --output-format text --dangerously-skip-permissions` | `--dangerously-skip-permissions` |
-| Gemini | `gemini -y` | `-y` (YOLO mode) |
+| Claude | `claude -p --output-format text --dangerously-skip-permissions "<prompt>"` | `--dangerously-skip-permissions` |
+| Gemini | `gemini -p "<prompt>" -y` | `-y` (YOLO mode) |
 | Codex | `codex exec --dangerously-bypass-approvals-and-sandbox -` | `--dangerously-bypass-approvals-and-sandbox` |
 
-**Note**: `-` in Codex command means read prompt from stdin. All tools receive prompts via stdin. Codex now bypasses its internal sandbox by default; pass `--codex-use-sandbox` to restore the older `--full-auto` mode. The review flow is constrained to the local checkout and should not need remote PR pages or web search.
+**Note**: Codex reads the prompt from stdin via `-`. Gemini runs in headless mode via `-p/--prompt`, and Claude review prompts are passed as the final CLI argument in `-p` mode. Codex now bypasses its internal sandbox by default; pass `--codex-use-sandbox` to restore the older `--full-auto` mode. The review flow is constrained to the local checkout and should not need remote PR pages or web search.
 
 ## Timeouts
 

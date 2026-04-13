@@ -29,6 +29,8 @@ class AgentConfig:
     cli_name: str                  # CLI executable name
     not_found_msg: str             # Error message when CLI not found
     env_setup: Optional[Callable[[dict], dict]] = None  # Optional env setup function
+    command_builder: Optional[Callable[[str], list[str]]] = None  # Optional prompt-aware command builder
+    prompt_via_stdin: bool = True  # Whether the review prompt should be written to stdin
     timeout: int = 1800            # Timeout in seconds (default: 30 min)
 
 
@@ -93,9 +95,22 @@ def generate_review_prompt(context: dict, reviewer: str = 'codex') -> str:
     owner = context.get('owner', '')
     repo = context.get('repo', '')
     repo_dir = context.get('repo_dir', '.')
+    custom_rules = context.get('custom_rules', '')
 
     # Categorize files
     file_categories = categorize_files(changed_files)
+
+    # Build optional custom rules section
+    custom_rules_section = ''
+    if custom_rules:
+        custom_rules_section = f"""
+5. **Custom Review Rules (Project-Specific)**
+
+   The following are project-specific review rules provided by the project maintainer.
+   Treat these rules with HIGH PRIORITY — they override or supplement the default focus areas above.
+
+{custom_rules}
+"""
 
     prompt = f"""# Change Review Task
 
@@ -151,7 +166,7 @@ Perform a thorough change review by:
    - Documentation (Markdown/docs): incorrect or outdated instructions, wrong flags/paths,
      broken references, misleading examples, missing steps, or unsafe guidance
    - Config/build/CI: insecure defaults, mismatched versions, missing required keys
-
+{custom_rules_section}
 ## Output Format - CRITICAL
 
 You MUST output each issue in the EXACT format below. Do NOT output summaries, tables, or prose.
@@ -215,6 +230,30 @@ def build_codex_command(
     return command
 
 
+def build_claude_command(
+    prompt: str,
+    *,
+    append_system_prompt: Optional[str] = None
+) -> list[str]:
+    """Build a Claude Code CLI command for non-interactive reviews."""
+    command = [
+        'claude',
+        '-p',
+        '--output-format',
+        'text',
+        '--dangerously-skip-permissions',
+    ]
+    if append_system_prompt:
+        command.extend(['--append-system-prompt', append_system_prompt])
+    command.append(prompt)
+    return command
+
+
+def build_gemini_command(prompt: str) -> list[str]:
+    """Build a Gemini CLI command for non-interactive reviews."""
+    return ['gemini', '-p', prompt, '-y']
+
+
 def categorize_files(files: list[str]) -> dict:
     """Categorize files by type/directory."""
     categories = {
@@ -259,6 +298,52 @@ def format_file_categories(categories: dict) -> str:
             lines.append("")
 
     return '\n'.join(lines)
+
+
+def load_custom_rules(
+    repo_dir: Path,
+    cli_rules: Optional[str] = None,
+    cli_rules_file: Optional[Path] = None,
+) -> str:
+    """Load and merge custom review rules from multiple sources.
+
+    Priority (all sources are stacked, highest priority first):
+    1. CLI inline rules text (--custom-rules)
+    2. CLI rules file (--custom-rules-file)
+    3. Project-local .code-guarder/review-rules.md
+
+    Returns:
+        Merged rules string ready for prompt injection, or empty string.
+    """
+    rules_parts = []
+
+    # Layer 3: project-local rules (lowest priority, listed first)
+    project_rules = repo_dir / '.code-guarder' / 'review-rules.md'
+    if project_rules.exists():
+        content = project_rules.read_text().strip()
+        if content:
+            rules_parts.append(
+                f"### Project Rules (from .code-guarder/review-rules.md)\n\n{content}"
+            )
+            print_success(f"Loaded project rules: {project_rules}")
+
+    # Layer 2: CLI-specified rules file
+    if cli_rules_file:
+        if cli_rules_file.exists():
+            content = cli_rules_file.read_text().strip()
+            if content:
+                rules_parts.append(
+                    f"### Team Rules (from {cli_rules_file.name})\n\n{content}"
+                )
+                print_success(f"Loaded rules file: {cli_rules_file}")
+        else:
+            print_warning(f"Custom rules file not found: {cli_rules_file}")
+
+    # Layer 1: CLI inline rules (highest priority, listed last)
+    if cli_rules:
+        rules_parts.append(f"### Override Rules\n\n{cli_rules.strip()}")
+
+    return '\n\n---\n\n'.join(rules_parts)
 
 
 # =============================================================================
@@ -327,8 +412,7 @@ Now analyze the current directory structure and source files, then write CLAUDE.
         env['PYTHONUNBUFFERED'] = '1'
 
         proc = subprocess.run(
-            ['claude', '-p', '--output-format', 'text', '--dangerously-skip-permissions'],
-            input=init_prompt,
+            build_claude_command(init_prompt),
             capture_output=True,
             text=True,
             cwd=repo_dir,
@@ -506,7 +590,7 @@ Now analyze the current directory structure and source files, then write GEMINI.
     try:
         # Use -p for non-interactive prompt mode, -y for auto-approve
         proc = subprocess.run(
-            ['gemini', '-p', init_prompt, '-y'],
+            build_gemini_command(init_prompt),
             capture_output=True,
             text=True,
             cwd=repo_dir,
@@ -610,9 +694,11 @@ def run_agent_generic(
         if config.env_setup:
             env = config.env_setup(env)
 
+        command = config.command_builder(prompt) if config.command_builder else list(config.command)
+
         # Start process
         proc = subprocess.Popen(
-            config.command,
+            command,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -628,9 +714,12 @@ def run_agent_generic(
         stderr_thread.start()
 
         # Write prompt to stdin
-        try:
-            proc.stdin.write(prompt)
-        finally:
+        if config.prompt_via_stdin:
+            try:
+                proc.stdin.write(prompt)
+            finally:
+                proc.stdin.close()
+        else:
             proc.stdin.close()
 
         # Read stdout
@@ -694,12 +783,16 @@ def run_claude_agent(repo_dir: Path, prompt: str, output_file: Path) -> tuple[Pa
 
     config = AgentConfig(
         name='Claude Code',
-        command=['claude', '-p', '--output-format', 'text', '--dangerously-skip-permissions',
-                 '--append-system-prompt', format_instruction],
+        command=[],
         color=Colors.CLAUDE,
         cli_name='claude',
         not_found_msg="Claude CLI not found. Install with: npm install -g @anthropic-ai/claude-code",
         env_setup=setup_claude_env,
+        command_builder=lambda prompt: build_claude_command(
+            prompt,
+            append_system_prompt=format_instruction
+        ),
+        prompt_via_stdin=False,
         timeout=1800
     )
 
@@ -711,10 +804,12 @@ def run_gemini_agent(repo_dir: Path, prompt: str, output_file: Path) -> tuple[Pa
 
     config = AgentConfig(
         name='Gemini',
-        command=['gemini', '-y'],
+        command=[],
         color=Colors.GEMINI,
         cli_name='gemini',
         not_found_msg="Gemini CLI not found",
+        command_builder=build_gemini_command,
+        prompt_via_stdin=False,
         timeout=1800
     )
 
@@ -817,6 +912,7 @@ def generate_single_report(issues: list[dict], context: dict, output_dir: Path, 
     repo = context.get('repo', '')
     pr_id = context.get('pr_id', '')
     title = context.get('title', '')
+    raw_output_path = output_dir / f"{prefix}_output.txt"
 
     # Sort by severity
     severity_order = {'critical': 0, 'high': 1, 'medium': 2, 'low': 3}
@@ -827,6 +923,11 @@ def generate_single_report(issues: list[dict], context: dict, output_dir: Path, 
     md_lines.append(f"**Reviewer**: {prefix.upper()}\n")
     if title:
         md_lines.append(f"**{title}**\n")
+
+    if not issues:
+        md_lines.append("No structured issues were parsed from the reviewer output.")
+        if raw_output_path.exists():
+            md_lines.append(f"See raw output: `{raw_output_path.name}`")
 
     current_severity = None
     for issue in issues:
@@ -877,6 +978,13 @@ def generate_html_report(issues: list[dict], context: dict, reviewer: str = '') 
     pr_id = context.get('pr_id', '')
     title = context.get('title', '')
     reviewer_title = f" - {reviewer.upper()}" if reviewer else ""
+    empty_state = ""
+    if not issues:
+        empty_state = (
+            '<div class="section"><div class="issue" style="border-top: 1px solid #e2e8f0; '
+            'border-radius: 0.5rem;">No structured issues were parsed from the reviewer output.'
+            '</div></div>'
+        )
 
     html = f'''<!DOCTYPE html>
 <html lang="en">
@@ -911,6 +1019,7 @@ def generate_html_report(issues: list[dict], context: dict, reviewer: str = '') 
     <div class="container">
         <h1>Code Review: {owner}/{repo}#{pr_id}{reviewer_title}</h1>
         <div class="subtitle">{title}</div>
+        {empty_state}
 '''
 
     severity_groups = {'critical': [], 'high': [], 'medium': [], 'low': []}
@@ -957,6 +1066,18 @@ def generate_consolidation_prompt(review_reports: dict[str, Path], context: dict
 
     all_reports = "\n\n---\n\n".join(reports_content)
 
+    custom_rules = context.get('custom_rules', '')
+    custom_rules_section = ''
+    if custom_rules:
+        custom_rules_section = f"""
+## Project-Specific Review Rules
+
+When validating issues, also consider these project-specific rules.
+Issues that violate these rules should be given higher priority:
+
+{custom_rules}
+"""
+
     prompt = f"""# Change Review Consolidation Task
 
 You are consolidating change review findings from multiple AI reviewers.
@@ -965,7 +1086,7 @@ You are consolidating change review findings from multiple AI reviewers.
 - Repository: {context.get('owner', '')}/{context.get('repo', '')}
 - PR: #{context.get('pr_id', '')}
 - Title: {context.get('title', '')}
-
+{custom_rules_section}
 ## Individual Review Reports
 
 {all_reports}
@@ -1451,15 +1572,16 @@ def run_parallel_reviews(
         if result_file.exists() and result_file.stat().st_size > 0:
             content = result_file.read_text()
             issues = parse_issues(content, source=reviewer)
+            report_path = output_dir / f"{reviewer}_review.md"
 
             # Generate individual report
+            generate_single_report(issues, context, output_dir, reviewer)
             if issues:
-                generate_single_report(issues, context, output_dir, reviewer)
                 print_success(f"{reviewer.upper()}: Found {len(issues)} issues")
-                return reviewer, output_dir / f"{reviewer}_review.md", issues
+                return reviewer, report_path, issues
             else:
-                print_warning(f"{reviewer.upper()}: No structured issues found")
-                return reviewer, None, []
+                print_warning(f"{reviewer.upper()}: No structured issues found; saved raw output and empty report")
+                return reviewer, report_path, []
         else:
             print_warning(f"{reviewer.upper()}: No output generated")
             return reviewer, None, []
@@ -1535,6 +1657,10 @@ AI Tool Context Files:
     parser.add_argument("--consolidation-model", type=str, default='claude',
                         choices=['claude', 'gemini', 'codex'],
                         help="AI model for consolidation phase (default: claude)")
+    parser.add_argument("--custom-rules", type=str, default=None,
+                        help="Custom review rules text to inject into the review prompt")
+    parser.add_argument("--custom-rules-file", type=Path, default=None,
+                        help="Path to a markdown file containing custom review rules")
 
     args = parser.parse_args()
 
@@ -1607,6 +1733,16 @@ AI Tool Context Files:
         print_error(f"Repository not found: {repo_dir}")
         sys.exit(1)
 
+    # Load custom review rules
+    custom_rules = load_custom_rules(
+        repo_dir,
+        cli_rules=args.custom_rules,
+        cli_rules_file=args.custom_rules_file,
+    )
+    if custom_rules:
+        context['custom_rules'] = custom_rules
+        print_step(f"Custom review rules loaded ({len(custom_rules)} chars)")
+
     # Create output directory
     args.output.mkdir(parents=True, exist_ok=True)
 
@@ -1677,26 +1813,24 @@ AI Tool Context Files:
             # Check for duplicates and mark as trusted
             _mark_duplicate_confidence(merged_issues)
 
-            if merged_issues:
-                md_path, html_path, json_path = generate_final_report(
-                    merged_issues, context, args.output, active_reviewers
-                )
-                print_success(f"Final report: {len(merged_issues)} merged issues")
-                print(f"\n  Final Report: {md_path}", file=sys.stderr)
-                print(f"  HTML:         {html_path}", file=sys.stderr)
-                print(f"  JSON:         {json_path}", file=sys.stderr)
+            md_path, html_path, json_path = generate_final_report(
+                merged_issues, context, args.output, active_reviewers
+            )
+            print_success(f"Final report: {len(merged_issues)} merged issues")
+            print(f"\n  Final Report: {md_path}", file=sys.stderr)
+            print(f"  HTML:         {html_path}", file=sys.stderr)
+            print(f"  JSON:         {json_path}", file=sys.stderr)
     elif len(review_reports) == 1:
         # Single reviewer - just rename the report as final
         reviewer = list(review_reports.keys())[0]
         issues = all_issues.get(reviewer, [])
-        if issues:
-            md_path, html_path, json_path = generate_final_report(
-                issues, context, args.output, [reviewer]
-            )
-            print_success(f"Final report: {len(issues)} issues")
-            print(f"\n  Final Report: {md_path}", file=sys.stderr)
-            print(f"  HTML:         {html_path}", file=sys.stderr)
-            print(f"  JSON:         {json_path}", file=sys.stderr)
+        md_path, html_path, json_path = generate_final_report(
+            issues, context, args.output, [reviewer]
+        )
+        print_success(f"Final report: {len(issues)} issues")
+        print(f"\n  Final Report: {md_path}", file=sys.stderr)
+        print(f"  HTML:         {html_path}", file=sys.stderr)
+        print(f"  JSON:         {json_path}", file=sys.stderr)
     else:
         print_warning("No review reports generated")
 

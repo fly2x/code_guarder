@@ -56,6 +56,22 @@ class CodexCommandTests(unittest.TestCase):
         self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", cmd)
         self.assertEqual(cmd[-1], "-")
 
+    def test_build_claude_command_passes_prompt_as_argument(self):
+        cmd = run_review.build_claude_command(
+            "review this change",
+            append_system_prompt="only issue blocks",
+        )
+
+        self.assertEqual(cmd[0:2], ["claude", "-p"])
+        self.assertIn("--append-system-prompt", cmd)
+        self.assertEqual(cmd[-1], "review this change")
+        self.assertNotIn("-", cmd[2:])
+
+    def test_build_gemini_command_uses_prompt_flag(self):
+        cmd = run_review.build_gemini_command("review this change")
+
+        self.assertEqual(cmd, ["gemini", "-p", "review this change", "-y"])
+
 
 class ReviewPromptTests(unittest.TestCase):
     def test_generate_review_prompt_enforces_local_only_review(self):
@@ -108,6 +124,47 @@ class FileCategorizationTests(unittest.TestCase):
         )
         self.assertEqual(categories["docs"], ["docs/review-notes.md"])
         self.assertEqual(categories["other"], [])
+
+
+class ParallelReviewReportTests(unittest.TestCase):
+    def test_run_parallel_reviews_keeps_empty_report_when_output_is_unstructured(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_dir = Path(tmpdir) / "repo"
+            repo_dir.mkdir()
+            output_dir = Path(tmpdir) / "out"
+            output_dir.mkdir()
+            context = {
+                "repo_dir": str(repo_dir),
+                "owner": "owner",
+                "repo": "repo",
+                "pr_id": "123",
+                "changed_files": ["src/main.py"],
+                "changed_files_count": 1,
+            }
+
+            def fake_gemini(repo_dir, prompt, output_file):
+                output_file.write_text("No issues found.\n")
+                return output_file, ["No issues found."]
+
+            with patch("scripts.run_review.run_gemini_agent", side_effect=fake_gemini):
+                review_reports, all_issues = run_review.run_parallel_reviews(
+                    repo_dir=repo_dir,
+                    context=context,
+                    output_dir=output_dir,
+                    use_claude=False,
+                    use_gemini=True,
+                    use_codex=False,
+                )
+
+            self.assertEqual(all_issues["gemini"], [])
+            self.assertEqual(review_reports["gemini"], output_dir / "gemini_review.md")
+            self.assertTrue((output_dir / "gemini_review.md").exists())
+            self.assertTrue((output_dir / "gemini_review.html").exists())
+            self.assertTrue((output_dir / "gemini_review.json").exists())
+            self.assertIn(
+                "No structured issues were parsed from the reviewer output.",
+                (output_dir / "gemini_review.md").read_text(),
+            )
 
 
 if __name__ == "__main__":
