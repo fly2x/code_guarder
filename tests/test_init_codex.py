@@ -56,6 +56,19 @@ class CodexCommandTests(unittest.TestCase):
         self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", cmd)
         self.assertEqual(cmd[-1], "-")
 
+    def test_build_codex_command_can_set_model_and_reasoning_effort(self):
+        cmd = run_review.build_codex_command(
+            Path("/tmp/repo"),
+            model=run_review.CODEX_SPARK_MODEL,
+            reasoning_effort="xhigh",
+        )
+
+        self.assertIn("--model", cmd)
+        self.assertIn(run_review.CODEX_SPARK_MODEL, cmd)
+        self.assertIn("-c", cmd)
+        self.assertIn('model_reasoning_effort="xhigh"', cmd)
+        self.assertEqual(cmd[-1], "-")
+
     def test_build_claude_command_passes_prompt_as_argument(self):
         cmd = run_review.build_claude_command(
             "review this change",
@@ -165,6 +178,62 @@ class ParallelReviewReportTests(unittest.TestCase):
                 "No structured issues were parsed from the reviewer output.",
                 (output_dir / "gemini_review.md").read_text(),
             )
+
+    def test_run_parallel_reviews_passes_codex_reasoning_effort(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_dir = Path(tmpdir) / "repo"
+            repo_dir.mkdir()
+            output_dir = Path(tmpdir) / "out"
+            output_dir.mkdir()
+            context = {
+                "repo_dir": str(repo_dir),
+                "owner": "owner",
+                "repo": "repo",
+                "pr_id": "123",
+                "changed_files": ["src/main.py"],
+                "changed_files_count": 1,
+            }
+
+            def fake_codex(repo_dir, prompt, output_file, **kwargs):
+                self.assertEqual(kwargs["reasoning_effort"], "xhigh")
+                output_file.write_text("")
+                return output_file, []
+
+            with patch("scripts.run_review.run_codex_review_agent", side_effect=fake_codex):
+                run_review.run_parallel_reviews(
+                    repo_dir=repo_dir,
+                    context=context,
+                    output_dir=output_dir,
+                    use_claude=False,
+                    use_gemini=False,
+                    use_codex=True,
+                    codex_reasoning_effort="xhigh",
+                )
+
+
+class ConsolidationTests(unittest.TestCase):
+    def test_run_consolidation_supports_codex_spark(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_dir = Path(tmpdir) / "repo"
+            repo_dir.mkdir()
+            output_dir = Path(tmpdir) / "out"
+            output_dir.mkdir()
+            review_report = output_dir / "gemini_review.md"
+            review_report.write_text("===ISSUE===\nFILE: src/main.py\nLINE: 1\nTITLE: t\n===END===\n")
+
+            with patch("scripts.run_review.run_codex_agent", return_value=(output_dir / "consolidation_output.txt", [])) as mock_codex:
+                run_review.run_consolidation(
+                    repo_dir=repo_dir,
+                    review_reports={"gemini": review_report},
+                    context={"owner": "owner", "repo": "repo", "pr_id": "123"},
+                    output_dir=output_dir,
+                    consolidation_model="codex-spark",
+                    codex_reasoning_effort="xhigh",
+                )
+
+        kwargs = mock_codex.call_args.kwargs
+        self.assertEqual(kwargs["model"], run_review.CODEX_SPARK_MODEL)
+        self.assertEqual(kwargs["reasoning_effort"], "xhigh")
 
 
 if __name__ == "__main__":

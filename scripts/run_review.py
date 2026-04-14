@@ -25,6 +25,10 @@ except ImportError:
     import pr_comments as pr_comments_module
 
 
+CODEX_SPARK_MODEL = "gpt-5.3-codex-spark"
+CODEX_REASONING_EFFORT_CHOICES = ["low", "medium", "high", "xhigh"]
+
+
 @dataclass
 class AgentConfig:
     """Configuration for AI agent runners."""
@@ -215,10 +219,17 @@ Start the review now. Output each issue as you find it.
 def build_codex_command(
     repo_dir: Path,
     *,
-    use_sandbox: bool = False
+    use_sandbox: bool = False,
+    model: Optional[str] = None,
+    reasoning_effort: Optional[str] = None,
 ) -> list[str]:
     """Build a Codex CLI command for this repository."""
     command = ['codex', 'exec']
+
+    if model:
+        command.extend(['--model', model])
+    if reasoning_effort:
+        command.extend(['-c', f'model_reasoning_effort="{reasoning_effort}"'])
 
     # Default to bypass mode because some local environments break Codex's
     # internal sandbox. Callers can opt back into the sandbox explicitly.
@@ -448,7 +459,12 @@ Now analyze the current directory structure and source files, then write CLAUDE.
         return False
 
 
-def init_codex(repo_dir: Path, use_sandbox: bool = False) -> bool:
+def init_codex(
+    repo_dir: Path,
+    use_sandbox: bool = False,
+    model: Optional[str] = None,
+    reasoning_effort: Optional[str] = None,
+) -> bool:
     """Initialize Codex context by generating AGENTS.md if not exists.
 
     Note: Codex CLI's /init slash command only works in interactive TUI mode.
@@ -511,7 +527,12 @@ Output rules:
 """
 
     try:
-        command = build_codex_command(repo_dir, use_sandbox=use_sandbox)
+        command = build_codex_command(
+            repo_dir,
+            use_sandbox=use_sandbox,
+            model=model,
+            reasoning_effort=reasoning_effort,
+        )
         command[-1:-1] = ['--output-last-message', str(agents_md)]
         proc = subprocess.run(
             command,
@@ -619,7 +640,8 @@ def init_ai_tools(
     use_claude: bool,
     use_gemini: bool,
     use_codex: bool,
-    codex_use_sandbox: bool = False
+    codex_use_sandbox: bool = False,
+    codex_reasoning_effort: Optional[str] = None,
 ) -> None:
     """Initialize all enabled AI tools in parallel."""
     print_header("Initializing AI Tools")
@@ -630,7 +652,14 @@ def init_ai_tools(
     if use_gemini:
         init_tasks.append(('gemini', init_gemini))
     if use_codex:
-        init_tasks.append(('codex', lambda repo_dir: init_codex(repo_dir, use_sandbox=codex_use_sandbox)))
+        init_tasks.append((
+            'codex',
+            lambda repo_dir: init_codex(
+                repo_dir,
+                use_sandbox=codex_use_sandbox,
+                reasoning_effort=codex_reasoning_effort,
+            ),
+        ))
 
     if not init_tasks:
         return
@@ -827,13 +856,20 @@ def run_codex_agent(
     repo_dir: Path,
     prompt: str,
     output_file: Path,
-    use_sandbox: bool = False
+    use_sandbox: bool = False,
+    model: Optional[str] = None,
+    reasoning_effort: Optional[str] = None,
 ) -> tuple[Path, list[str]]:
     """Run generic Codex CLI agent with real-time output streaming."""
 
     config = AgentConfig(
         name='Codex',
-        command=build_codex_command(repo_dir, use_sandbox=use_sandbox),
+        command=build_codex_command(
+            repo_dir,
+            use_sandbox=use_sandbox,
+            model=model,
+            reasoning_effort=reasoning_effort,
+        ),
         color=Colors.CODEX,
         cli_name='codex',
         not_found_msg="Codex CLI not found",
@@ -847,13 +883,20 @@ def run_codex_review_agent(
     repo_dir: Path,
     prompt: str,
     output_file: Path,
-    use_sandbox: bool = False
+    use_sandbox: bool = False,
+    model: Optional[str] = None,
+    reasoning_effort: Optional[str] = None,
 ) -> tuple[Path, list[str]]:
     """Run Codex CLI for review using the project-specific stdin prompt."""
 
     config = AgentConfig(
         name='Codex',
-        command=build_codex_command(repo_dir, use_sandbox=use_sandbox),
+        command=build_codex_command(
+            repo_dir,
+            use_sandbox=use_sandbox,
+            model=model,
+            reasoning_effort=reasoning_effort,
+        ),
         color=Colors.CODEX,
         cli_name='codex',
         not_found_msg="Codex CLI not found",
@@ -1170,7 +1213,8 @@ def run_consolidation(
     context: dict,
     output_dir: Path,
     consolidation_model: str = 'claude',
-    codex_use_sandbox: bool = False
+    codex_use_sandbox: bool = False,
+    codex_reasoning_effort: Optional[str] = None,
 ) -> Path:
     """Run AI CLI to consolidate all review reports.
 
@@ -1179,7 +1223,7 @@ def run_consolidation(
         review_reports: Dictionary of reviewer -> report path
         context: Review context dict
         output_dir: Output directory
-        consolidation_model: Which AI to use for consolidation (claude|gemini|codex)
+        consolidation_model: Which AI to use for consolidation (claude|gemini|codex|codex-spark)
     """
 
     print_header("Consolidating Review Reports")
@@ -1197,7 +1241,19 @@ def run_consolidation(
         'claude': ('Claude Code', lambda repo_dir, prompt, output_file: run_claude_agent(repo_dir, prompt, output_file)),
         'gemini': ('Gemini CLI', lambda repo_dir, prompt, output_file: run_gemini_agent(repo_dir, prompt, output_file)),
         'codex': ('Codex CLI', lambda repo_dir, prompt, output_file: run_codex_agent(
-            repo_dir, prompt, output_file, use_sandbox=codex_use_sandbox
+            repo_dir,
+            prompt,
+            output_file,
+            use_sandbox=codex_use_sandbox,
+            reasoning_effort=codex_reasoning_effort,
+        )),
+        'codex-spark': ('Codex CLI (GPT-5.3-Codex-Spark)', lambda repo_dir, prompt, output_file: run_codex_agent(
+            repo_dir,
+            prompt,
+            output_file,
+            use_sandbox=codex_use_sandbox,
+            model=CODEX_SPARK_MODEL,
+            reasoning_effort=codex_reasoning_effort,
         )),
     }
 
@@ -1534,7 +1590,8 @@ def run_parallel_reviews(
     use_claude: bool = True,
     use_gemini: bool = False,
     use_codex: bool = False,
-    codex_use_sandbox: bool = False
+    codex_use_sandbox: bool = False,
+    codex_reasoning_effort: Optional[str] = None,
 ) -> dict[str, Path]:
     """Run multiple AI reviews in parallel."""
 
@@ -1570,7 +1627,8 @@ def run_parallel_reviews(
                 repo_dir,
                 prompt,
                 output_file,
-                use_sandbox=codex_use_sandbox
+                use_sandbox=codex_use_sandbox,
+                reasoning_effort=codex_reasoning_effort,
             )
         else:
             return reviewer, None, []
@@ -1627,8 +1685,8 @@ Examples:
   # With context file from fetch_pr.py
   %(prog)s --context ./workspace/review_context.json --gemini --output ./review-output
 
-  # Specify consolidation model (default: claude)
-  %(prog)s --context ./workspace/review_context.json --gemini --consolidation-model gemini --output ./review-output
+  # Use Codex Spark for consolidation with explicit reasoning effort
+  %(prog)s --context ./workspace/review_context.json --gemini --consolidation-model codex-spark --codex-reasoning-effort xhigh --output ./review-output
 
 AI Tool Context Files:
   - Claude Code: CLAUDE.md (project instructions, coding style)
@@ -1653,6 +1711,9 @@ AI Tool Context Files:
     parser.add_argument("--codex-use-sandbox", action="store_true",
                         help="Run Codex with its internal sandbox instead of the default bypass mode")
     parser.add_argument("--codex-bypass-sandbox", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--codex-reasoning-effort", type=str, default=None,
+                        choices=CODEX_REASONING_EFFORT_CHOICES,
+                        help="Override Codex reasoning effort (low|medium|high|xhigh)")
     parser.add_argument("--no-consolidate", action="store_true",
                         help="Skip consolidation phase (keep individual reports only)")
     parser.add_argument("--init", "-i", action="store_true",
@@ -1662,7 +1723,7 @@ AI Tool Context Files:
     parser.add_argument("--head-ref", type=str, default="HEAD",
                         help="Head ref for diff (default: HEAD)")
     parser.add_argument("--consolidation-model", type=str, default='claude',
-                        choices=['claude', 'gemini', 'codex'],
+                        choices=['claude', 'gemini', 'codex', 'codex-spark'],
                         help="AI model for consolidation phase (default: claude)")
     parser.add_argument("--custom-rules", type=str, default=None,
                         help="Custom review rules text to inject into the review prompt")
@@ -1778,7 +1839,8 @@ AI Tool Context Files:
             use_claude,
             use_gemini,
             use_codex,
-            codex_use_sandbox=args.codex_use_sandbox
+            codex_use_sandbox=args.codex_use_sandbox,
+            codex_reasoning_effort=args.codex_reasoning_effort,
         )
 
     # Phase 1: Run parallel reviews
@@ -1789,7 +1851,8 @@ AI Tool Context Files:
         use_claude=use_claude,
         use_gemini=use_gemini,
         use_codex=use_codex,
-        codex_use_sandbox=args.codex_use_sandbox
+        codex_use_sandbox=args.codex_use_sandbox,
+        codex_reasoning_effort=args.codex_reasoning_effort,
     )
 
     active_reviewers = [r for r in ['claude', 'gemini', 'codex']
@@ -1809,7 +1872,8 @@ AI Tool Context Files:
             context,
             args.output,
             args.consolidation_model,
-            codex_use_sandbox=args.codex_use_sandbox
+            codex_use_sandbox=args.codex_use_sandbox,
+            codex_reasoning_effort=args.codex_reasoning_effort,
         )
 
         consolidated_issues = []

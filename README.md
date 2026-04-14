@@ -79,6 +79,9 @@ python3 scripts/run_review.py --context ./workspace/review_context.json --codex-
 
 # Specify consolidation model (default: claude)
 python3 scripts/run_review.py --context ./workspace/review_context.json --gemini --consolidation-model gemini -o ./review-output
+
+# Use Codex Spark for consolidation with explicit Codex reasoning effort
+python3 scripts/run_review.py --context ./workspace/review_context.json --gemini --consolidation-model codex-spark --codex-reasoning-effort xhigh -o ./review-output
 ```
 
 ### Command Line Options
@@ -92,9 +95,10 @@ python3 scripts/run_review.py --context ./workspace/review_context.json --gemini
 | `--codex`, `-x` | Enable Codex CLI parallel review (default on) |
 | `--no-codex` | Disable Codex CLI review |
 | `--codex-use-sandbox` | Run Codex with its internal sandbox instead of the default bypass mode |
+| `--codex-reasoning-effort` | Override Codex reasoning effort: low, medium, high, or xhigh |
 | `--init`, `-i` | Initialize AI tools before review |
 | `--no-consolidate` | Skip consolidation phase |
-| `--consolidation-model` | AI model for consolidation phase: claude, gemini, or codex (default: claude) |
+| `--consolidation-model` | AI model for consolidation phase: claude, gemini, codex, or codex-spark (default: claude) |
 | `--base-ref` | Base ref for diff (default: origin/main) |
 | `--head-ref` | Head ref for diff (default: HEAD) |
 | `--custom-rules` | Custom review rules text to inject into the review prompt |
@@ -145,7 +149,8 @@ PR URL --> fetch_pr.py --clone --> cloned repo + context.json
                                          |
                                 Consolidation Phase
                                 (Claude validates by default,
-                                 use --consolidation-model to change)
+                                 use --consolidation-model to change,
+                                 including codex-spark)
                                          |
                                 final_report.md/html/json
 ```
@@ -274,7 +279,7 @@ FIX:
 | Gemini | `gemini -p "<prompt>" -y` | `-y` (YOLO mode) |
 | Codex | `codex exec --dangerously-bypass-approvals-and-sandbox -` | `--dangerously-bypass-approvals-and-sandbox` |
 
-**Note**: Codex reads the prompt from stdin via `-`. Gemini runs in headless mode via `-p/--prompt`, and Claude review prompts are passed as the final CLI argument in `-p` mode. Codex now bypasses its internal sandbox by default; pass `--codex-use-sandbox` to restore the older `--full-auto` mode. The review flow is constrained to the local checkout and should not need remote PR pages or web search.
+**Note**: Codex reads the prompt from stdin via `-`. Gemini runs in headless mode via `-p/--prompt`, and Claude review prompts are passed as the final CLI argument in `-p` mode. Codex now bypasses its internal sandbox by default; pass `--codex-use-sandbox` to restore the older `--full-auto` mode. `run_review.py` can also pass `--codex-reasoning-effort`, and `--consolidation-model codex-spark` maps Codex consolidation to `gpt-5.3-codex-spark`. The review flow is constrained to the local checkout and should not need remote PR pages or web search.
 
 ## Timeouts
 
