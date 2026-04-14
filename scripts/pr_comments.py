@@ -49,6 +49,7 @@ class PublishOptions:
     need_to_resolve: bool = False
     dedupe: bool = True
     timeout: int = 30
+    fallback_to_pr_comment: bool = True
 
 
 @dataclass
@@ -167,42 +168,45 @@ class GitCodeApiClient:
 
     def list_comments(self) -> list[dict[str, Any]]:
         comments: list[dict[str, Any]] = []
-        page = 1
         per_page = 100
-        while True:
-            response = self.request_json(
-                "GET",
-                f"/repos/{self.owner}/{self.repo}/pulls/{self.pr_number}/comments",
-                query={
-                    "page": page,
-                    "per_page": per_page,
-                    "comment_type": "diff_comment",
-                    "direction": "asc",
-                },
-                expected_statuses=(200,),
-            )
-            if not isinstance(response, list):
-                raise GitCodeApiError("Unexpected GitCode PR comments response format")
-            comments.extend(response)
-            if len(response) < per_page:
-                break
-            page += 1
+        for comment_type in ("diff_comment", "pr_comment"):
+            page = 1
+            while True:
+                response = self.request_json(
+                    "GET",
+                    f"/repos/{self.owner}/{self.repo}/pulls/{self.pr_number}/comments",
+                    query={
+                        "page": page,
+                        "per_page": per_page,
+                        "comment_type": comment_type,
+                        "direction": "asc",
+                    },
+                    expected_statuses=(200,),
+                )
+                if not isinstance(response, list):
+                    raise GitCodeApiError("Unexpected GitCode PR comments response format")
+                comments.extend(response)
+                if len(response) < per_page:
+                    break
+                page += 1
         return comments
 
     def create_comment(
         self,
         *,
         body: str,
-        path: str,
-        position: int,
+        path: str | None = None,
+        position: int | None = None,
         need_to_resolve: bool = False,
     ) -> dict[str, Any]:
         payload = {
             "body": body,
-            "path": path,
-            "position": position,
             "need_to_resolve": need_to_resolve,
         }
+        if path:
+            payload["path"] = path
+        if position is not None:
+            payload["position"] = position
 
         last_error: GitCodeApiError | None = None
         for method in ("POST", "PUT"):
@@ -493,7 +497,9 @@ def _find_unique_snippet_match(
     snippets: list[str],
     *,
     hunk_ids: list[int] | None = None,
+    candidates: list[int] | None = None,
 ) -> DiffLine | None:
+    ranked_matches: list[tuple[int, int, int, DiffLine]] = []
     for snippet in snippets:
         matches = [
             line
@@ -503,8 +509,19 @@ def _find_unique_snippet_match(
             and (hunk_ids is None or line.hunk_id in hunk_ids)
         ]
         if len(matches) == 1:
-            return matches[0]
-    return None
+            match = matches[0]
+            distance = 0
+            if candidates:
+                line_number = match.new_line if match.new_line is not None else match.old_line
+                if line_number is not None:
+                    distance = min(abs(line_number - candidate) for candidate in candidates)
+            ranked_matches.append((distance, -len(snippet), match.position, match))
+
+    if not ranked_matches:
+        return None
+
+    ranked_matches.sort(key=lambda item: (item[0], item[1], item[2]))
+    return ranked_matches[0][3]
 
 
 def _collect_candidate_hunk_ids(
@@ -568,7 +585,12 @@ def resolve_patch_target(issue: dict[str, Any], patch_diff: str) -> ResolvedDiff
     candidate_hunk_ids, hunk_strategy = _collect_candidate_hunk_ids(diff_lines, candidates)
 
     if snippets and candidate_hunk_ids:
-        matched_line = _find_unique_snippet_match(diff_lines, snippets, hunk_ids=candidate_hunk_ids)
+        matched_line = _find_unique_snippet_match(
+            diff_lines,
+            snippets,
+            hunk_ids=candidate_hunk_ids,
+            candidates=candidates,
+        )
         if matched_line is not None:
             return ResolvedDiffPosition(
                 position=matched_line.position,
@@ -625,10 +647,12 @@ def _log_comment_plan(item: dict[str, Any]) -> None:
         print(
             "[comment-plan] planned "
             f"file={item.get('file', '')}:{item.get('line', '')} "
+            f"type={item.get('comment_type', 'diff_comment')} "
             f"target={item.get('path', '')}:{item.get('resolved_line')} "
             f"diff_position={item.get('resolved_position')} "
             f"position={display_position} "
-            f"strategy={item.get('position_strategy', '')}",
+            f"strategy={item.get('position_strategy', '')} "
+            f"fallback={item.get('fallback_reason', '')}",
             file=sys.stderr,
         )
         return
@@ -689,6 +713,29 @@ def _build_patch_index_from_files(files: list[dict[str, Any]]) -> dict[str, dict
     return patch_index
 
 
+def _patch_entry_rank(entry: dict[str, Any]) -> tuple[int, int, int, int]:
+    diff = str(entry.get("diff") or "")
+    return (
+        1 if diff.strip() else 0,
+        0 if entry.get("too_large") else 1,
+        len(diff.splitlines()),
+        len(diff),
+    )
+
+
+def _merge_patch_indexes(*indexes: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    merged: dict[str, dict[str, Any]] = {}
+    for index in indexes:
+        for path, entry in index.items():
+            candidate = dict(entry)
+            if not candidate.get("path"):
+                candidate["path"] = path
+            existing = merged.get(path)
+            if existing is None or _patch_entry_rank(candidate) >= _patch_entry_rank(existing):
+                merged[path] = candidate
+    return merged
+
+
 def _extract_patch_body(diff_text: str) -> str:
     # Local git diff includes file headers; GitCode patch.diff starts at the first hunk.
     lines = diff_text.splitlines()
@@ -734,20 +781,38 @@ def load_patch_index(
     *,
     client: GitCodeApiClient | None = None,
 ) -> tuple[dict[str, dict[str, Any]], str]:
+    api_patch_index: dict[str, dict[str, Any]] = {}
     if client is not None:
         try:
             files = client.list_pull_files()
-            patch_index = _build_patch_index_from_files(files)
-            if patch_index:
-                return patch_index, "gitcode_api"
+            api_patch_index = _build_patch_index_from_files(files)
         except GitCodeApiError:
-            pass
+            api_patch_index = {}
 
     local_patch_index = _build_local_patch_index(context)
-    if local_patch_index:
-        return local_patch_index, "local_git_diff"
+    patch_index = _merge_patch_indexes(api_patch_index, local_patch_index)
+    if patch_index:
+        sources = []
+        if api_patch_index:
+            sources.append("gitcode_api")
+        if local_patch_index:
+            sources.append("local_git_diff")
+        return patch_index, "+".join(sources)
 
     return {}, "unavailable"
+
+
+def _plan_pr_comment_fallback(
+    item: dict[str, Any],
+    issue: dict[str, Any],
+    fingerprint: str,
+    *,
+    fallback_reason: str,
+) -> None:
+    item["comment_type"] = "pr_comment"
+    item["fallback_reason"] = fallback_reason
+    item["position_strategy"] = f"pr_comment_fallback:{fallback_reason}"
+    item["body"] = render_comment_body(issue, fingerprint)
 
 
 def build_comment_plan(
@@ -795,6 +860,8 @@ def build_comment_plan(
             "resolved_old_line": None,
             "resolved_hunk_id": None,
             "position_strategy": "",
+            "comment_type": "diff_comment",
+            "fallback_reason": "",
             "body": "",
         }
 
@@ -806,8 +873,18 @@ def build_comment_plan(
             continue
 
         if changed_files and item["file"] not in changed_files:
-            item["status"] = "skipped"
-            item["reason"] = "file_not_in_changed_files"
+            if options.fallback_to_pr_comment:
+                item["reason"] = "file_not_in_changed_files"
+                _plan_pr_comment_fallback(
+                    item,
+                    issue,
+                    fingerprint,
+                    fallback_reason="file_not_in_changed_files",
+                )
+                planned_count += 1
+            else:
+                item["status"] = "skipped"
+                item["reason"] = "file_not_in_changed_files"
             items.append(item)
             _log_comment_plan(item)
             continue
@@ -828,23 +905,53 @@ def build_comment_plan(
 
         patch_entry = patch_index.get(item["file"])
         if not patch_entry:
-            item["status"] = "skipped"
-            item["reason"] = "patch_not_found"
+            if options.fallback_to_pr_comment:
+                item["reason"] = "patch_not_found"
+                _plan_pr_comment_fallback(
+                    item,
+                    issue,
+                    fingerprint,
+                    fallback_reason="patch_not_found",
+                )
+                planned_count += 1
+            else:
+                item["status"] = "skipped"
+                item["reason"] = "patch_not_found"
             items.append(item)
             _log_comment_plan(item)
             continue
 
         if patch_entry.get("too_large"):
-            item["status"] = "skipped"
-            item["reason"] = "patch_too_large"
+            if options.fallback_to_pr_comment:
+                item["reason"] = "patch_too_large"
+                _plan_pr_comment_fallback(
+                    item,
+                    issue,
+                    fingerprint,
+                    fallback_reason="patch_too_large",
+                )
+                planned_count += 1
+            else:
+                item["status"] = "skipped"
+                item["reason"] = "patch_too_large"
             items.append(item)
             _log_comment_plan(item)
             continue
 
         resolved = resolve_patch_target(issue, str(patch_entry.get("diff") or ""))
         if resolved is None:
-            item["status"] = "skipped"
-            item["reason"] = "position_not_found"
+            if options.fallback_to_pr_comment:
+                item["reason"] = "position_not_found"
+                _plan_pr_comment_fallback(
+                    item,
+                    issue,
+                    fingerprint,
+                    fallback_reason="position_not_found",
+                )
+                planned_count += 1
+            else:
+                item["status"] = "skipped"
+                item["reason"] = "position_not_found"
             items.append(item)
             _log_comment_plan(item)
             continue
@@ -1009,18 +1116,22 @@ def publish_review_comments(
             continue
 
         try:
-            response = client.create_comment(
-                body=item["body"],
-                path=str(item["path"]),
-                position=int(item["position"]),
-                need_to_resolve=options.need_to_resolve,
-            )
+            create_kwargs: dict[str, Any] = {
+                "body": item["body"],
+                "need_to_resolve": options.need_to_resolve,
+            }
+            if item.get("comment_type") == "diff_comment":
+                create_kwargs["path"] = str(item["path"])
+                create_kwargs["position"] = int(item["position"])
+
+            response = client.create_comment(**create_kwargs)
             item["status"] = "posted"
             item["comment_id"] = response.get("id")
             posted += 1
             print(
                 "[comment-post] posted "
                 f"file={item.get('file', '')}:{item.get('line', '')} "
+                f"type={item.get('comment_type', 'diff_comment')} "
                 f"target={item.get('path', '')}:{item.get('resolved_line')} "
                 f"diff_position={item.get('resolved_position')} "
                 f"position={item.get('resolved_line') or item.get('position')} "
@@ -1034,6 +1145,7 @@ def publish_review_comments(
             print(
                 "[comment-post] failed "
                 f"file={item.get('file', '')}:{item.get('line', '')} "
+                f"type={item.get('comment_type', 'diff_comment')} "
                 f"target={item.get('path', '')}:{item.get('resolved_line')} "
                 f"diff_position={item.get('resolved_position')} "
                 f"position={item.get('resolved_line') or item.get('position')} "

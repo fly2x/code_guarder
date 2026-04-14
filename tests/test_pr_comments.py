@@ -569,6 +569,186 @@ class CommentPlanTests(unittest.TestCase):
             ),
         )
 
+    def test_load_patch_index_merges_api_and_local_and_prefers_richer_diff(self):
+        class FakeClient:
+            def list_pull_files(self):
+                return [
+                    {
+                        "filename": "pki/cms/src/hitls_cms_envelopeddata.c",
+                        "patch": {
+                            "diff": "\n".join(
+                                [
+                                    "@@ -0,0 +1,3 @@",
+                                    "+line1",
+                                    "+line2",
+                                ]
+                            ),
+                            "new_path": "pki/cms/src/hitls_cms_envelopeddata.c",
+                            "too_large": False,
+                        },
+                    }
+                ]
+
+        local_patch_index = {
+            "pki/cms/src/hitls_cms_envelopeddata.c": {
+                "path": "pki/cms/src/hitls_cms_envelopeddata.c",
+                "diff": "\n".join(
+                    [
+                        "@@ -0,0 +1,6 @@",
+                        "+line1",
+                        "+line2",
+                        "+line3",
+                        "+line4",
+                        "+line5",
+                    ]
+                ),
+                "too_large": False,
+            }
+        }
+
+        with patch("scripts.pr_comments._build_local_patch_index", return_value=local_patch_index):
+            patch_index, patch_source = pr_comments.load_patch_index({}, client=FakeClient())
+
+        self.assertEqual(patch_source, "gitcode_api+local_git_diff")
+        self.assertEqual(
+            patch_index["pki/cms/src/hitls_cms_envelopeddata.c"]["diff"],
+            local_patch_index["pki/cms/src/hitls_cms_envelopeddata.c"]["diff"],
+        )
+
+    def test_build_comment_plan_falls_back_to_pr_comment_when_position_not_found(self):
+        issue = {
+            "file": "pki/cms/src/hitls_cms_envelopeddata.c",
+            "line": "294-295",
+            "severity": "critical",
+            "confidence": "trusted",
+            "title": "Integer overflow on one-shot cipher buffer allocation",
+            "problem": "Example issue.",
+            "code": "uint32_t ciphertextLen = plaintext->dataLen + blockSize;",
+            "fix": "Validate the addition first.",
+            "reviewers": "CODEX",
+        }
+        context = {
+            "platform": "gitcode",
+            "owner": "owner",
+            "repo": "repo",
+            "pr_id": "15",
+            "changed_files": ["pki/cms/src/hitls_cms_envelopeddata.c"],
+        }
+        patch_index = {
+            "pki/cms/src/hitls_cms_envelopeddata.c": {
+                "path": "pki/cms/src/hitls_cms_envelopeddata.c",
+                "diff": "\n".join(
+                    [
+                        "@@ -0,0 +1,3 @@",
+                        "+line1",
+                        "+line2",
+                    ]
+                ),
+                "too_large": False,
+            }
+        }
+
+        plan = pr_comments.build_comment_plan(
+            [issue],
+            context,
+            patch_index,
+            pr_comments.PublishOptions(),
+        )
+
+        self.assertEqual(plan["summary"]["planned"], 1)
+        self.assertEqual(plan["summary"]["skipped"], 0)
+        self.assertEqual(plan["items"][0]["status"], "planned")
+        self.assertEqual(plan["items"][0]["comment_type"], "pr_comment")
+        self.assertEqual(plan["items"][0]["fallback_reason"], "position_not_found")
+        self.assertEqual(plan["items"][0]["reason"], "position_not_found")
+
+    def test_build_comment_plan_prefers_closest_unique_snippet_in_large_new_file_hunk(self):
+        diff_lines = ["@@ -0,0 +1,780 @@"]
+        for line_number in range(1, 781):
+            content = f"line_{line_number}"
+            if line_number == 294:
+                content = "uint32_t ciphertextLen = plaintext->dataLen + blockSize;"
+            elif line_number == 295:
+                content = "uint8_t *ciphertext = BSL_SAL_Malloc(ciphertextLen);"
+            elif line_number == 776:
+                content = "uint32_t maxPlaintextLen = encInfo->encryptedContent.dataLen + blockSize;"
+            diff_lines.append(f"+{content}")
+
+        issue = {
+            "file": "pki/cms/src/hitls_cms_envelopeddata.c",
+            "line": "294-295",
+            "severity": "critical",
+            "confidence": "trusted",
+            "title": "Integer overflow on one-shot cipher buffer allocation",
+            "problem": "Example issue.",
+            "code": "\n".join(
+                [
+                    "uint32_t ciphertextLen = plaintext->dataLen + blockSize;",
+                    "uint32_t maxPlaintextLen = encInfo->encryptedContent.dataLen + blockSize;",
+                ]
+            ),
+            "fix": "Validate the additions first.",
+            "reviewers": "CODEX",
+        }
+        context = {
+            "platform": "gitcode",
+            "owner": "owner",
+            "repo": "repo",
+            "pr_id": "15",
+            "changed_files": ["pki/cms/src/hitls_cms_envelopeddata.c"],
+        }
+        patch_index = {
+            "pki/cms/src/hitls_cms_envelopeddata.c": {
+                "path": "pki/cms/src/hitls_cms_envelopeddata.c",
+                "diff": "\n".join(diff_lines),
+                "too_large": False,
+            }
+        }
+
+        plan = pr_comments.build_comment_plan(
+            [issue],
+            context,
+            patch_index,
+            pr_comments.PublishOptions(),
+        )
+
+        self.assertEqual(plan["items"][0]["status"], "planned")
+        self.assertEqual(plan["items"][0]["comment_type"], "diff_comment")
+        self.assertEqual(plan["items"][0]["resolved_line"], 294)
+
+    def test_build_comment_plan_falls_back_to_pr_comment_for_unchanged_file(self):
+        issue = {
+            "file": "cmake/hitls_options.cmake",
+            "line": "428-432",
+            "severity": "high",
+            "confidence": "trusted",
+            "title": "EnvelopedData feature is not user-configurable through CMake options",
+            "problem": "Example issue.",
+            "code": "option(HITLS_PKI_CMS_ENCRYPTDATA \"CMS EncryptedData\" OFF)",
+            "fix": "Add the missing option.",
+            "reviewers": "CODEX",
+        }
+        context = {
+            "platform": "gitcode",
+            "owner": "owner",
+            "repo": "repo",
+            "pr_id": "15",
+            "changed_files": ["pki/cms/src/hitls_cms_envelopeddata.c"],
+        }
+
+        plan = pr_comments.build_comment_plan(
+            [issue],
+            context,
+            patch_index={},
+            options=pr_comments.PublishOptions(),
+        )
+
+        self.assertEqual(plan["summary"]["planned"], 1)
+        self.assertEqual(plan["summary"]["skipped"], 0)
+        self.assertEqual(plan["items"][0]["status"], "planned")
+        self.assertEqual(plan["items"][0]["comment_type"], "pr_comment")
+        self.assertEqual(plan["items"][0]["fallback_reason"], "file_not_in_changed_files")
+
 
 class PublishCommentsTests(unittest.TestCase):
     def test_publish_review_comments_uses_resolved_source_line_for_gitcode_position(self):
@@ -639,6 +819,7 @@ class PublishCommentsTests(unittest.TestCase):
         self.assertEqual(result["status"], "ok")
         self.assertEqual(result["summary"]["posted"], 1)
         self.assertEqual(FakeClient.last_kwargs["position"], 11)
+        self.assertEqual(FakeClient.last_kwargs["path"], "src/app.py")
 
     def test_publish_review_comments_skips_duplicate_fingerprint(self):
         issue = {
@@ -708,6 +889,75 @@ class PublishCommentsTests(unittest.TestCase):
         self.assertEqual(result["summary"]["posted"], 0)
         self.assertEqual(result["items"][0]["status"], "skipped")
         self.assertEqual(result["items"][0]["reason"], "duplicate_fingerprint")
+
+    def test_publish_review_comments_posts_pr_comment_when_inline_position_cannot_be_resolved(self):
+        issue = {
+            "file": "pki/cms/src/hitls_cms_envelopeddata.c",
+            "line": "294-295",
+            "severity": "critical",
+            "confidence": "trusted",
+            "title": "Integer overflow on one-shot cipher buffer allocation",
+            "problem": "Example issue.",
+            "code": "uint32_t ciphertextLen = plaintext->dataLen + blockSize;",
+            "fix": "Validate the addition first.",
+            "reviewers": "codex",
+        }
+        context = {
+            "platform": "gitcode",
+            "owner": "owner",
+            "repo": "repo",
+            "pr_id": "15",
+            "changed_files": ["pki/cms/src/hitls_cms_envelopeddata.c"],
+        }
+
+        class FakeClient:
+            last_kwargs = None
+
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def list_pull_files(self):
+                return [
+                    {
+                        "filename": "pki/cms/src/hitls_cms_envelopeddata.c",
+                        "patch": {
+                            "diff": "\n".join(
+                                [
+                                    "@@ -0,0 +1,3 @@",
+                                    "+line1",
+                                    "+line2",
+                                ]
+                            ),
+                            "new_path": "pki/cms/src/hitls_cms_envelopeddata.c",
+                            "too_large": False,
+                        },
+                    }
+                ]
+
+            def list_comments(self):
+                return []
+
+            def create_comment(self, **kwargs):
+                FakeClient.last_kwargs = kwargs
+                return {"id": "comment-2"}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            with patch.dict(os.environ, {"GITCODE_TOKEN": "token"}):
+                with patch("scripts.pr_comments.GitCodeApiClient", FakeClient):
+                    result = pr_comments.publish_review_comments(
+                        issues=[issue],
+                        context=context,
+                        output_dir=output_dir,
+                        options=pr_comments.PublishOptions(),
+                    )
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["summary"]["posted"], 1)
+        self.assertEqual(result["items"][0]["comment_type"], "pr_comment")
+        self.assertEqual(result["items"][0]["fallback_reason"], "position_not_found")
+        self.assertNotIn("path", FakeClient.last_kwargs)
+        self.assertNotIn("position", FakeClient.last_kwargs)
 
 
 class RunReviewIntegrationTests(unittest.TestCase):
@@ -784,6 +1034,7 @@ class RunReviewIntegrationTests(unittest.TestCase):
                     min_confidence="evaluate",
                     max_comments=50,
                     need_to_resolve=False,
+                    fallback_to_pr_comment=True,
                 ),
             )
 
