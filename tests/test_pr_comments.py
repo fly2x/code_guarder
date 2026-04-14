@@ -87,6 +87,20 @@ class CommentBodyTests(unittest.TestCase):
 
 
 class CommentPlanTests(unittest.TestCase):
+    def test_normalize_path_extracts_repo_relative_path_from_markdown_link(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_dir = Path(tmpdir) / "repo"
+            file_path = repo_dir / "src" / "app.py"
+            file_path.parent.mkdir(parents=True)
+            file_path.write_text("print('hello')\n")
+
+            markdown_path = f"[src/app.py](<{file_path}:11>)"
+
+            self.assertEqual(
+                pr_comments.normalize_path(markdown_path, repo_dir=repo_dir),
+                "src/app.py",
+            )
+
     def test_build_comment_plan_resolves_diff_position_and_filters(self):
         issues = [
             {
@@ -204,6 +218,61 @@ class CommentPlanTests(unittest.TestCase):
         self.assertEqual(len(planned_items), 1)
         self.assertEqual(planned_items[0]["position"], 18)
         self.assertEqual(planned_items[0]["resolved_position"], 9)
+
+    def test_build_comment_plan_accepts_markdown_file_links(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_dir = Path(tmpdir) / "repo"
+            file_path = repo_dir / "src" / "app.py"
+            file_path.parent.mkdir(parents=True)
+            file_path.write_text("def run():\n    pass\n")
+
+            issue = {
+                "file": f"[src/app.py]({file_path})",
+                "line": "11",
+                "severity": "high",
+                "confidence": "likely",
+                "title": "Unsafe shell invocation",
+                "problem": "User input reaches the shell without validation.",
+                "code": "subprocess.run(user_input, shell=True)",
+                "fix": "subprocess.run([safe_binary, safe_arg], check=True)",
+                "reviewers": "codex",
+            }
+            context = {
+                "platform": "gitcode",
+                "owner": "owner",
+                "repo": "repo",
+                "pr_id": "15",
+                "repo_dir": str(repo_dir),
+                "changed_files": ["src/app.py"],
+            }
+            patch_index = {
+                "src/app.py": {
+                    "path": "src/app.py",
+                    "diff": "\n".join(
+                        [
+                            "@@ -10,3 +10,4 @@ def run():",
+                            " context = prepare()",
+                            "-subprocess.run(user_input, shell=True)",
+                            "+subprocess.run(user_input, shell=True)",
+                            "+audit(context)",
+                            " return context",
+                        ]
+                    ),
+                    "too_large": False,
+                }
+            }
+
+            plan = pr_comments.build_comment_plan(
+                [issue],
+                context,
+                patch_index,
+                pr_comments.PublishOptions(),
+            )
+
+        self.assertEqual(plan["summary"]["planned"], 1)
+        self.assertEqual(plan["summary"]["skipped"], 0)
+        self.assertEqual(plan["items"][0]["status"], "planned")
+        self.assertEqual(plan["items"][0]["file"], "src/app.py")
 
     def test_build_comment_plan_remaps_high_line_context_to_added_line_in_same_hunk(self):
         issue = {

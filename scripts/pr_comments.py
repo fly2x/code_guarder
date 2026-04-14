@@ -36,6 +36,8 @@ CONFIDENCE_ORDER = {
 }
 
 FINGERPRINT_PATTERN = re.compile(r"code-guarder:fingerprint=([0-9a-f]{12,64})")
+MARKDOWN_LINK_PATTERN = re.compile(r"^\[(?P<label>.+?)\]\((?P<target>.+?)\)$")
+URL_SCHEME_PATTERN = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*://")
 
 
 @dataclass
@@ -229,17 +231,42 @@ def normalize_path(file_path: str | None, repo_dir: Path | None = None) -> str:
     if not file_path:
         return ""
 
-    normalized = str(file_path).strip().replace("\\", "/")
-    for prefix in ("./", "a/", "b/"):
-        if normalized.startswith(prefix):
-            normalized = normalized[len(prefix):]
-
+    repo_dir_str = ""
     if repo_dir:
         repo_dir_str = str(repo_dir.resolve()).replace("\\", "/")
-        if normalized.startswith(repo_dir_str + "/"):
-            normalized = normalized[len(repo_dir_str) + 1:]
 
-    return normalized.strip("/")
+    raw_value = str(file_path).strip()
+    candidates = [raw_value]
+    match = MARKDOWN_LINK_PATTERN.match(raw_value)
+    if match:
+        target = match.group("target").strip()
+        if target.startswith("<") and target.endswith(">"):
+            target = target[1:-1].strip()
+        candidates = [target, match.group("label").strip(), raw_value]
+
+    last_normalized = ""
+    for candidate in candidates:
+        normalized = str(candidate).strip().strip("`").replace("\\", "/")
+        if normalized.startswith("file://"):
+            normalized = urllib.parse.urlparse(normalized).path or normalized[7:]
+        if not URL_SCHEME_PATTERN.match(normalized):
+            normalized = re.sub(r":\d+(?::\d+)?$", "", normalized)
+        for prefix in ("./", "a/", "b/"):
+            if normalized.startswith(prefix):
+                normalized = normalized[len(prefix):]
+
+        if repo_dir_str and normalized.startswith(repo_dir_str + "/"):
+            return normalized[len(repo_dir_str) + 1 :].strip("/")
+
+        normalized = normalized.strip("/")
+        if not normalized:
+            continue
+
+        last_normalized = normalized
+        if not normalized.startswith("/") and not URL_SCHEME_PATTERN.match(normalized):
+            return normalized
+
+    return last_normalized
 
 
 def normalize_issue(issue: dict[str, Any], repo_dir: Path | None = None) -> dict[str, Any]:
@@ -830,9 +857,16 @@ def build_comment_plan(
             continue
 
         item["path"] = str(patch_entry.get("path") or item["file"])
-        item["position"] = get_issue_position(issue)
+        reported_position = get_issue_position(issue)
+        resolved_source_position = resolve_source_position(resolved)
+        item["position"] = reported_position
         if item["position"] is None:
-            item["position"] = resolve_source_position(resolved)
+            item["position"] = resolved_source_position
+        elif (
+            resolved_source_position is not None
+            and abs(resolved_source_position - item["position"]) > 3
+        ):
+            item["position"] = resolved_source_position
         item["resolved_position"] = resolved.position
         item["resolved_line"] = resolved.line.new_line
         item["resolved_old_line"] = resolved.line.old_line
