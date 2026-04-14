@@ -19,6 +19,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional, Callable
 
+try:
+    from scripts import pr_comments as pr_comments_module
+except ImportError:
+    import pr_comments as pr_comments_module
+
 
 @dataclass
 class AgentConfig:
@@ -132,6 +137,8 @@ You are reviewing PR #{pr_id} for {owner}/{repo}.
 
 - Review ONLY the local repository checkout in the current working directory.
 - Use local git/file inspection only.
+- Do NOT search the web.
+- Do NOT open GitHub, GitLab, Gitee, or GitCode pages.
 - If a git command fails, retry with another local command or inspect the changed files directly.
 - If local tooling is limited, continue from the checked-out files and changed-file list instead of switching to network search.
 
@@ -1661,6 +1668,20 @@ AI Tool Context Files:
                         help="Custom review rules text to inject into the review prompt")
     parser.add_argument("--custom-rules-file", type=Path, default=None,
                         help="Path to a markdown file containing custom review rules")
+    parser.add_argument("--publish-comments", action="store_true",
+                        help="Publish final review issues as inline PR comments when supported")
+    parser.add_argument("--publish-comments-dry-run", action="store_true",
+                        help="Build the PR comment plan without publishing comments")
+    parser.add_argument("--comment-min-severity", type=str, default="low",
+                        choices=["low", "medium", "high", "critical"],
+                        help="Minimum issue severity to publish as a PR comment")
+    parser.add_argument("--comment-min-confidence", type=str, default="evaluate",
+                        choices=["evaluate", "likely", "trusted"],
+                        help="Minimum confidence level to publish as a PR comment")
+    parser.add_argument("--comment-max-count", type=int, default=50,
+                        help="Maximum number of inline PR comments to publish")
+    parser.add_argument("--comment-need-to-resolve", action="store_true",
+                        help="Mark published PR comments as needing resolution where supported")
 
     args = parser.parse_args()
 
@@ -1678,6 +1699,10 @@ AI Tool Context Files:
         print_error("Conflicting flags: --codex and --no-codex")
         sys.exit(1)
     use_codex = not args.no_codex  # Default ON
+
+    if args.comment_max_count < 1:
+        print_error("--comment-max-count must be at least 1")
+        sys.exit(1)
 
     if not use_claude and not use_gemini and not use_codex:
         print_error("At least one reviewer must be enabled. Remove --no-codex or add --gemini/--claude")
@@ -1774,6 +1799,7 @@ AI Tool Context Files:
 
     # Phase 2: Consolidation (if multiple reviewers or explicitly requested)
     total_issues = sum(len(issues) for issues in all_issues.values())
+    final_issues = []
 
     if len(review_reports) > 1 and not args.no_consolidate:
         # Run consolidation with specified model (default: claude)
@@ -1792,6 +1818,7 @@ AI Tool Context Files:
             consolidated_issues = parse_consolidated_issues(content)
 
         if consolidated_issues:
+            final_issues = consolidated_issues
             md_path, html_path, json_path = generate_final_report(
                 consolidated_issues, context, args.output, active_reviewers
             )
@@ -1812,6 +1839,7 @@ AI Tool Context Files:
 
             # Check for duplicates and mark as trusted
             _mark_duplicate_confidence(merged_issues)
+            final_issues = merged_issues
 
             md_path, html_path, json_path = generate_final_report(
                 merged_issues, context, args.output, active_reviewers
@@ -1824,6 +1852,7 @@ AI Tool Context Files:
         # Single reviewer - just rename the report as final
         reviewer = list(review_reports.keys())[0]
         issues = all_issues.get(reviewer, [])
+        final_issues = issues
         md_path, html_path, json_path = generate_final_report(
             issues, context, args.output, [reviewer]
         )
@@ -1833,6 +1862,44 @@ AI Tool Context Files:
         print(f"  JSON:         {json_path}", file=sys.stderr)
     else:
         print_warning("No review reports generated")
+
+    if args.publish_comments or args.publish_comments_dry_run:
+        print_header("PR Comment Publishing")
+        if not final_issues:
+            print_warning("No final issues available for PR comment publishing")
+        else:
+            publish_result = pr_comments_module.publish_review_comments(
+                issues=final_issues,
+                context=context,
+                output_dir=args.output,
+                options=pr_comments_module.PublishOptions(
+                    dry_run=args.publish_comments_dry_run,
+                    min_severity=args.comment_min_severity,
+                    min_confidence=args.comment_min_confidence,
+                    max_comments=args.comment_max_count,
+                    need_to_resolve=args.comment_need_to_resolve,
+                ),
+            )
+
+            publish_summary = publish_result.get('summary', {})
+            status = publish_result.get('status', 'ok')
+            if status == 'unsupported':
+                print_warning(publish_result.get('error', 'PR comment publishing is not supported'))
+            elif status == 'failed':
+                print_error(publish_result.get('error', 'Some PR comments failed to publish'))
+            elif publish_summary.get('dry_run'):
+                print_success(
+                    f"Comment plan ready: {publish_summary.get('planned', 0)} planned, "
+                    f"{publish_summary.get('skipped', 0)} skipped"
+                )
+            else:
+                print_success(
+                    f"PR comments: {publish_summary.get('posted', 0)} posted, "
+                    f"{publish_summary.get('skipped', 0)} skipped, "
+                    f"{publish_summary.get('failed', 0)} failed"
+                )
+            print(f"  Comment plan:   {args.output / 'comment_plan.json'}", file=sys.stderr)
+            print(f"  Comment result: {args.output / 'comment_publish_result.json'}", file=sys.stderr)
 
     # Summary
     print_header("Review Complete")
