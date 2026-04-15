@@ -101,6 +101,23 @@ class CommentPlanTests(unittest.TestCase):
                 "src/app.py",
             )
 
+    def test_normalize_issue_extracts_line_from_embedded_file_suffix(self):
+        issue = {
+            "file": "src/app.py:11-12",
+            "severity": "high",
+            "confidence": "likely",
+            "title": "Unsafe shell invocation",
+            "problem": "User input reaches the shell without validation.",
+            "code": "subprocess.run(user_input, shell=True)",
+            "fix": "subprocess.run([safe_binary, safe_arg], check=True)",
+            "reviewers": "codex",
+        }
+
+        normalized = pr_comments.normalize_issue(issue)
+
+        self.assertEqual(normalized["file"], "src/app.py")
+        self.assertEqual(normalized["line"], "11-12")
+
     def test_build_comment_plan_resolves_diff_position_and_filters(self):
         issues = [
             {
@@ -961,6 +978,38 @@ class PublishCommentsTests(unittest.TestCase):
 
 
 class RunReviewIntegrationTests(unittest.TestCase):
+    def test_parse_consolidated_issues_extracts_line_from_file_field(self):
+        content = "\n".join(
+            [
+                "===ISSUE===",
+                "FILE: crypto/hbs/lms/src/lms_core.c:589",
+                "SEVERITY: high",
+                "TITLE: Non-constant-time root hash comparison during LMS signature verification",
+                "REVIEWERS: CLAUDE",
+                "CONFIDENCE: trusted",
+                "PROBLEM: Example issue.",
+                "CODE:",
+                "```c",
+                "if (memcmp(currentHash, info.expectedRoot, info.n) == 0) {",
+                "    return CRYPT_SUCCESS;",
+                "}",
+                "```",
+                "FIX:",
+                "```c",
+                "if (LmsConstTimeMemCmp(currentHash, info.expectedRoot, info.n) == 0) {",
+                "    return CRYPT_SUCCESS;",
+                "}",
+                "```",
+                "===END===",
+            ]
+        )
+
+        issues = run_review.parse_consolidated_issues(content)
+
+        self.assertEqual(len(issues), 1)
+        self.assertEqual(issues[0]["file"], "crypto/hbs/lms/src/lms_core.c")
+        self.assertEqual(issues[0]["line"], "589")
+
     def test_main_publishes_comments_when_requested(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             repo_dir = Path(tmpdir) / "repo"

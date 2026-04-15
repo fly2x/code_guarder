@@ -38,6 +38,9 @@ CONFIDENCE_ORDER = {
 FINGERPRINT_PATTERN = re.compile(r"code-guarder:fingerprint=([0-9a-f]{12,64})")
 MARKDOWN_LINK_PATTERN = re.compile(r"^\[(?P<label>.+?)\]\((?P<target>.+?)\)$")
 URL_SCHEME_PATTERN = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*://")
+EMBEDDED_LOCATION_PATTERN = re.compile(
+    r"^(?P<file>.+?):(?P<line>\d+(?:-\d+)?)(?::\d+)?$"
+)
 
 
 @dataclass
@@ -254,7 +257,7 @@ def normalize_path(file_path: str | None, repo_dir: Path | None = None) -> str:
         if normalized.startswith("file://"):
             normalized = urllib.parse.urlparse(normalized).path or normalized[7:]
         if not URL_SCHEME_PATTERN.match(normalized):
-            normalized = re.sub(r":\d+(?::\d+)?$", "", normalized)
+            normalized = re.sub(r":\d+(?:-\d+)?(?::\d+)?$", "", normalized)
         for prefix in ("./", "a/", "b/"):
             if normalized.startswith(prefix):
                 normalized = normalized[len(prefix):]
@@ -273,13 +276,41 @@ def normalize_path(file_path: str | None, repo_dir: Path | None = None) -> str:
     return last_normalized
 
 
+def split_issue_location(file_path: str | None, line: str | None = None) -> tuple[str, str]:
+    raw_file = str(file_path or "").strip()
+    raw_line = str(line or "").strip()
+    if raw_line or not raw_file:
+        return raw_file, raw_line
+
+    candidates = [raw_file]
+    match = MARKDOWN_LINK_PATTERN.match(raw_file)
+    if match:
+        target = match.group("target").strip()
+        if target.startswith("<") and target.endswith(">"):
+            target = target[1:-1].strip()
+        candidates = [target, raw_file]
+
+    for candidate in candidates:
+        normalized = str(candidate).strip().strip("`").replace("\\", "/")
+        if normalized.startswith("file://"):
+            normalized = urllib.parse.urlparse(normalized).path or normalized[7:]
+        if URL_SCHEME_PATTERN.match(normalized):
+            continue
+        location_match = EMBEDDED_LOCATION_PATTERN.match(normalized)
+        if location_match:
+            return location_match.group("file"), location_match.group("line")
+
+    return raw_file, raw_line
+
+
 def normalize_issue(issue: dict[str, Any], repo_dir: Path | None = None) -> dict[str, Any]:
     normalized = dict(issue)
-    normalized["file"] = normalize_path(issue.get("file"), repo_dir=repo_dir)
+    file_value, line_value = split_issue_location(issue.get("file"), issue.get("line"))
+    normalized["file"] = normalize_path(file_value, repo_dir=repo_dir)
     normalized["severity"] = str(issue.get("severity") or "medium").lower()
     normalized["confidence"] = str(issue.get("confidence") or "likely").lower()
     normalized["reviewers"] = issue.get("reviewers") or issue.get("source") or "unknown"
-    normalized["line"] = str(issue.get("line") or "").strip()
+    normalized["line"] = line_value
     normalized["title"] = str(issue.get("title") or "Issue").strip()
     normalized["problem"] = str(issue.get("problem") or "").strip()
     normalized["code"] = str(issue.get("code") or "").strip()

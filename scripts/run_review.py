@@ -141,6 +141,7 @@ You are reviewing PR #{pr_id} for {owner}/{repo}.
 
 - Review ONLY the local repository checkout in the current working directory.
 - Use local git/file inspection only.
+- Do NOT compile, build, or run project test commands as part of the review.
 - Do NOT search the web.
 - Do NOT open GitHub, GitLab, Gitee, or GitCode pages.
 - If a git command fails, retry with another local command or inspect the changed files directly.
@@ -1539,13 +1540,21 @@ def parse_consolidated_issues(content: str) -> list[dict]:
 
         issue = {}
 
+        file_value = ""
         file_match = re.search(r'FILE:\s*(.+?)(?:\n|$)', block)
         if file_match:
-            issue['file'] = file_match.group(1).strip()
+            file_value = file_match.group(1).strip()
 
+        line_value = ""
         line_match = re.search(r'LINE:\s*(\d+(?:-\d+)?)', block)
         if line_match:
-            issue['line'] = line_match.group(1).strip()
+            line_value = line_match.group(1).strip()
+
+        file_value, line_value = pr_comments_module.split_issue_location(file_value, line_value)
+        if file_value:
+            issue['file'] = pr_comments_module.normalize_path(file_value)
+        if line_value:
+            issue['line'] = line_value
 
         severity_match = re.search(r'SEVERITY:\s*(critical|high|medium|low)', block, re.I)
         if severity_match:

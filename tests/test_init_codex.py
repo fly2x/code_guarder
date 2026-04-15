@@ -101,6 +101,7 @@ class ReviewPromptTests(unittest.TestCase):
         self.assertIn("Repository root: `workspace/repo`", prompt)
         self.assertIn("Review ONLY the local repository checkout", prompt)
         self.assertIn("Do NOT search the web.", prompt)
+        self.assertIn("Do NOT compile, build, or run project test commands", prompt)
         self.assertIn("Do NOT open GitHub, GitLab, Gitee, or GitCode pages", prompt)
 
     def test_generate_review_prompt_mentions_assembly_review_rules(self):
