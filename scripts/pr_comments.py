@@ -795,6 +795,8 @@ def _build_local_patch_index(context: dict[str, Any]) -> dict[str, dict[str, Any
             cwd=repo_path,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
         )
         patch_diff = _extract_patch_body(result.stdout)
         if result.returncode != 0 or not patch_diff.strip():

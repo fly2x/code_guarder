@@ -1,5 +1,6 @@
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -585,6 +586,47 @@ class CommentPlanTests(unittest.TestCase):
                 ]
             ),
         )
+
+    def test_build_local_patch_index_tolerates_non_utf8_git_diff_output(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_dir = Path(tmpdir) / "repo"
+            repo_dir.mkdir()
+
+            def git(*args):
+                return subprocess.run(
+                    ["git", *args],
+                    cwd=repo_dir,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+
+            git("init")
+            git("config", "user.email", "test@example.com")
+            git("config", "user.name", "Test User")
+
+            file_path = repo_dir / "src" / "latin1.txt"
+            file_path.parent.mkdir(parents=True)
+            file_path.write_bytes(b"ok\n\xa1\n")
+            git("add", "src/latin1.txt")
+            git("commit", "-m", "initial")
+
+            file_path.write_bytes(b"ok\n\xa1\nmore\n")
+            git("add", "src/latin1.txt")
+            git("commit", "-m", "update")
+
+            patch_index = pr_comments._build_local_patch_index(
+                {
+                    "repo_dir": str(repo_dir),
+                    "base_ref": "HEAD~1",
+                    "head_ref": "HEAD",
+                    "changed_files": ["src/latin1.txt"],
+                }
+            )
+
+        self.assertIn("src/latin1.txt", patch_index)
+        self.assertTrue(patch_index["src/latin1.txt"]["diff"].startswith("@@"))
+        self.assertIn("+more", patch_index["src/latin1.txt"]["diff"])
 
     def test_load_patch_index_merges_api_and_local_and_prefers_richer_diff(self):
         class FakeClient:

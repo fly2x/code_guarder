@@ -27,6 +27,8 @@ except ImportError:
 
 CODEX_SPARK_MODEL = "gpt-5.3-codex-spark"
 CODEX_REASONING_EFFORT_CHOICES = ["low", "medium", "high", "xhigh"]
+DEFAULT_CONSOLIDATION_MODEL = "codex-spark"
+DEFAULT_CODEX_REASONING_EFFORT = "xhigh"
 
 
 @dataclass
@@ -222,7 +224,7 @@ def build_codex_command(
     *,
     use_sandbox: bool = False,
     model: Optional[str] = None,
-    reasoning_effort: Optional[str] = None,
+    reasoning_effort: Optional[str] = DEFAULT_CODEX_REASONING_EFFORT,
 ) -> list[str]:
     """Build a Codex CLI command for this repository."""
     command = ['codex', 'exec']
@@ -464,7 +466,7 @@ def init_codex(
     repo_dir: Path,
     use_sandbox: bool = False,
     model: Optional[str] = None,
-    reasoning_effort: Optional[str] = None,
+    reasoning_effort: Optional[str] = DEFAULT_CODEX_REASONING_EFFORT,
 ) -> bool:
     """Initialize Codex context by generating AGENTS.md if not exists.
 
@@ -642,7 +644,7 @@ def init_ai_tools(
     use_gemini: bool,
     use_codex: bool,
     codex_use_sandbox: bool = False,
-    codex_reasoning_effort: Optional[str] = None,
+    codex_reasoning_effort: Optional[str] = DEFAULT_CODEX_REASONING_EFFORT,
 ) -> None:
     """Initialize all enabled AI tools in parallel."""
     print_header("Initializing AI Tools")
@@ -859,7 +861,7 @@ def run_codex_agent(
     output_file: Path,
     use_sandbox: bool = False,
     model: Optional[str] = None,
-    reasoning_effort: Optional[str] = None,
+    reasoning_effort: Optional[str] = DEFAULT_CODEX_REASONING_EFFORT,
 ) -> tuple[Path, list[str]]:
     """Run generic Codex CLI agent with real-time output streaming."""
 
@@ -886,7 +888,7 @@ def run_codex_review_agent(
     output_file: Path,
     use_sandbox: bool = False,
     model: Optional[str] = None,
-    reasoning_effort: Optional[str] = None,
+    reasoning_effort: Optional[str] = DEFAULT_CODEX_REASONING_EFFORT,
 ) -> tuple[Path, list[str]]:
     """Run Codex CLI for review using the project-specific stdin prompt."""
 
@@ -1213,9 +1215,9 @@ def run_consolidation(
     review_reports: dict[str, Path],
     context: dict,
     output_dir: Path,
-    consolidation_model: str = 'claude',
+    consolidation_model: str = DEFAULT_CONSOLIDATION_MODEL,
     codex_use_sandbox: bool = False,
-    codex_reasoning_effort: Optional[str] = None,
+    codex_reasoning_effort: Optional[str] = DEFAULT_CODEX_REASONING_EFFORT,
 ) -> Path:
     """Run AI CLI to consolidate all review reports.
 
@@ -1259,8 +1261,11 @@ def run_consolidation(
     }
 
     if consolidation_model not in agent_map:
-        print_warning(f"Unknown consolidation model '{consolidation_model}', defaulting to 'claude'")
-        consolidation_model = 'claude'
+        print_warning(
+            f"Unknown consolidation model '{consolidation_model}', "
+            f"defaulting to '{DEFAULT_CONSOLIDATION_MODEL}'"
+        )
+        consolidation_model = DEFAULT_CONSOLIDATION_MODEL
 
     model_name, agent_func = agent_map[consolidation_model]
     print_step(f"Running {model_name} for consolidation and validation...")
@@ -1600,7 +1605,7 @@ def run_parallel_reviews(
     use_gemini: bool = False,
     use_codex: bool = False,
     codex_use_sandbox: bool = False,
-    codex_reasoning_effort: Optional[str] = None,
+    codex_reasoning_effort: Optional[str] = DEFAULT_CODEX_REASONING_EFFORT,
 ) -> dict[str, Path]:
     """Run multiple AI reviews in parallel."""
 
@@ -1694,7 +1699,7 @@ Examples:
   # With context file from fetch_pr.py
   %(prog)s --context ./workspace/review_context.json --gemini --output ./review-output
 
-  # Use Codex Spark for consolidation with explicit reasoning effort
+  # Explicitly pin the default Codex Spark consolidation settings
   %(prog)s --context ./workspace/review_context.json --gemini --consolidation-model codex-spark --codex-reasoning-effort xhigh --output ./review-output
 
 AI Tool Context Files:
@@ -1720,9 +1725,9 @@ AI Tool Context Files:
     parser.add_argument("--codex-use-sandbox", action="store_true",
                         help="Run Codex with its internal sandbox instead of the default bypass mode")
     parser.add_argument("--codex-bypass-sandbox", action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument("--codex-reasoning-effort", type=str, default=None,
+    parser.add_argument("--codex-reasoning-effort", type=str, default=DEFAULT_CODEX_REASONING_EFFORT,
                         choices=CODEX_REASONING_EFFORT_CHOICES,
-                        help="Override Codex reasoning effort (low|medium|high|xhigh)")
+                        help=f"Override Codex reasoning effort (default: {DEFAULT_CODEX_REASONING_EFFORT})")
     parser.add_argument("--no-consolidate", action="store_true",
                         help="Skip consolidation phase (keep individual reports only)")
     parser.add_argument("--init", "-i", action="store_true",
@@ -1731,9 +1736,9 @@ AI Tool Context Files:
                         help="Base ref for diff (default: origin/main)")
     parser.add_argument("--head-ref", type=str, default="HEAD",
                         help="Head ref for diff (default: HEAD)")
-    parser.add_argument("--consolidation-model", type=str, default='claude',
+    parser.add_argument("--consolidation-model", type=str, default=DEFAULT_CONSOLIDATION_MODEL,
                         choices=['claude', 'gemini', 'codex', 'codex-spark'],
-                        help="AI model for consolidation phase (default: claude)")
+                        help=f"AI model for consolidation phase (default: {DEFAULT_CONSOLIDATION_MODEL})")
     parser.add_argument("--custom-rules", type=str, default=None,
                         help="Custom review rules text to inject into the review prompt")
     parser.add_argument("--custom-rules-file", type=Path, default=None,
@@ -1874,7 +1879,7 @@ AI Tool Context Files:
     final_issues = []
 
     if len(review_reports) > 1 and not args.no_consolidate:
-        # Run consolidation with specified model (default: claude)
+        # Run consolidation with the configured default model unless overridden.
         consolidation_output = run_consolidation(
             repo_dir,
             review_reports,

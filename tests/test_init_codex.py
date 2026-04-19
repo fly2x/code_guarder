@@ -1,3 +1,4 @@
+import json
 import subprocess
 import tempfile
 import unittest
@@ -42,6 +43,11 @@ class CodexCommandTests(unittest.TestCase):
             Path("/tmp/repo")
         )
 
+        self.assertIn("-c", cmd)
+        self.assertIn(
+            f'model_reasoning_effort="{run_review.DEFAULT_CODEX_REASONING_EFFORT}"',
+            cmd,
+        )
         self.assertIn("--dangerously-bypass-approvals-and-sandbox", cmd)
         self.assertNotIn("--full-auto", cmd)
         self.assertEqual(cmd[-1], "-")
@@ -180,7 +186,7 @@ class ParallelReviewReportTests(unittest.TestCase):
                 (output_dir / "gemini_review.md").read_text(),
             )
 
-    def test_run_parallel_reviews_passes_codex_reasoning_effort(self):
+    def test_run_parallel_reviews_defaults_codex_reasoning_effort_to_xhigh(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             repo_dir = Path(tmpdir) / "repo"
             repo_dir.mkdir()
@@ -208,12 +214,11 @@ class ParallelReviewReportTests(unittest.TestCase):
                     use_claude=False,
                     use_gemini=False,
                     use_codex=True,
-                    codex_reasoning_effort="xhigh",
                 )
 
 
 class ConsolidationTests(unittest.TestCase):
-    def test_run_consolidation_supports_codex_spark(self):
+    def test_run_consolidation_defaults_to_codex_spark_with_xhigh_reasoning_effort(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             repo_dir = Path(tmpdir) / "repo"
             repo_dir.mkdir()
@@ -228,13 +233,96 @@ class ConsolidationTests(unittest.TestCase):
                     review_reports={"gemini": review_report},
                     context={"owner": "owner", "repo": "repo", "pr_id": "123"},
                     output_dir=output_dir,
-                    consolidation_model="codex-spark",
-                    codex_reasoning_effort="xhigh",
                 )
 
         kwargs = mock_codex.call_args.kwargs
         self.assertEqual(kwargs["model"], run_review.CODEX_SPARK_MODEL)
-        self.assertEqual(kwargs["reasoning_effort"], "xhigh")
+        self.assertEqual(
+            kwargs["reasoning_effort"],
+            run_review.DEFAULT_CODEX_REASONING_EFFORT,
+        )
+
+
+class MainDefaultsTests(unittest.TestCase):
+    def test_main_defaults_to_codex_spark_consolidation_and_xhigh_effort(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            repo_dir = tmpdir_path / "repo"
+            repo_dir.mkdir()
+            output_dir = tmpdir_path / "out"
+            context_path = tmpdir_path / "review_context.json"
+            context_path.write_text(json.dumps({
+                "repo_dir": str(repo_dir),
+                "owner": "owner",
+                "repo": "repo",
+                "pr_id": "123",
+                "changed_files": ["src/main.py"],
+                "changed_files_count": 1,
+            }))
+
+            consolidated_issue = {
+                "file": "src/main.py",
+                "line": "1",
+                "severity": "low",
+                "confidence": "likely",
+                "title": "t",
+                "summary": "s",
+                "reviewers": "codex, gemini",
+            }
+
+            def fake_run_consolidation(*args, **kwargs):
+                consolidation_output = args[3] / "consolidation_output.txt"
+                consolidation_output.write_text("===ISSUE===\nFILE: src/main.py\nLINE: 1\nTITLE: t\n===END===\n")
+                return consolidation_output
+
+            with patch.object(
+                run_review.sys,
+                "argv",
+                [
+                    "run_review.py",
+                    "--context",
+                    str(context_path),
+                    "--gemini",
+                    "--output",
+                    str(output_dir),
+                ],
+            ):
+                with patch(
+                    "scripts.run_review.run_parallel_reviews",
+                    return_value=(
+                        {
+                            "codex": output_dir / "codex_review.md",
+                            "gemini": output_dir / "gemini_review.md",
+                        },
+                        {"codex": [], "gemini": []},
+                    ),
+                ):
+                    with patch(
+                        "scripts.run_review.run_consolidation",
+                        side_effect=fake_run_consolidation,
+                    ) as mock_consolidation:
+                        with patch(
+                            "scripts.run_review.parse_consolidated_issues",
+                            return_value=[consolidated_issue],
+                        ):
+                            with patch(
+                                "scripts.run_review.generate_final_report",
+                                return_value=(
+                                    output_dir / "final_report.md",
+                                    output_dir / "final_report.html",
+                                    output_dir / "final_report.json",
+                                ),
+                            ):
+                                run_review.main()
+
+        self.assertEqual(
+            mock_consolidation.call_args.args[4],
+            run_review.DEFAULT_CONSOLIDATION_MODEL,
+        )
+        self.assertEqual(
+            mock_consolidation.call_args.kwargs["codex_reasoning_effort"],
+            run_review.DEFAULT_CODEX_REASONING_EFFORT,
+        )
 
 
 if __name__ == "__main__":
