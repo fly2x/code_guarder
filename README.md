@@ -1,12 +1,12 @@
 # Code Guarder
 
-Multi-AI collaborative code review system. Uses Claude Code, Gemini CLI, and Codex CLI as parallel reviewers, cross-validates findings to eliminate false positives, and generates consolidated reports.
+Multi-AI collaborative code review system. Uses Claude Code, Gemini CLI, Codex CLI, and OpenCode as parallel reviewers, cross-validates findings to eliminate false positives, and generates consolidated reports.
 
 ## Features
 
 | Feature | Description |
 |---------|-------------|
-| Multi-AI Review | Codex (default) + Claude + Gemini run in parallel |
+| Multi-AI Review | Codex (default) + Claude + Gemini + OpenCode run in parallel |
 | Agent Mode | AIs explore codebase on demand, no context limit |
 | Cross-validation | Merge duplicates, mark confidence levels |
 | Documentation Review | Reviews Markdown/docs changes for correctness and safety |
@@ -43,6 +43,9 @@ npm install -g @google/gemini-cli
 
 # Codex CLI
 npm install -g @openai/codex
+
+# OpenCode CLI
+npm install -g opencode-ai
 ```
 
 ## Commands
@@ -65,11 +68,14 @@ python3 scripts/run_review.py --context ./workspace/review_context.json --claude
 # Codex + Gemini in parallel
 python3 scripts/run_review.py --context ./workspace/review_context.json --gemini -o ./review-output
 
-# All three AI reviewers (Codex + Claude + Gemini)
-python3 scripts/run_review.py --context ./workspace/review_context.json --claude --gemini -o ./review-output
+# Codex + OpenCode in parallel
+python3 scripts/run_review.py --context ./workspace/review_context.json --opencode -o ./review-output
+
+# All four AI reviewers (Codex + Claude + Gemini + OpenCode)
+python3 scripts/run_review.py --context ./workspace/review_context.json --claude --gemini --opencode -o ./review-output
 
 # Initialize AI tools before review (generates CLAUDE.md, GEMINI.md, AGENTS.md)
-python3 scripts/run_review.py --context ./workspace/review_context.json --init --claude --gemini -o ./review-output
+python3 scripts/run_review.py --context ./workspace/review_context.json --init --claude --gemini --opencode -o ./review-output
 
 # Skip consolidation phase
 python3 scripts/run_review.py --context ./workspace/review_context.json --gemini --no-consolidate -o ./review-output
@@ -92,13 +98,14 @@ python3 scripts/run_review.py --context ./workspace/review_context.json --gemini
 | `--output`, `-o` | Output directory (default: ./review-output) |
 | `--claude` | Enable Claude Code parallel review |
 | `--gemini`, `-g` | Enable Gemini CLI parallel review |
+| `--opencode` | Enable OpenCode CLI parallel review |
 | `--codex`, `-x` | Enable Codex CLI parallel review (default on) |
 | `--no-codex` | Disable Codex CLI review |
 | `--codex-use-sandbox` | Run Codex with its internal sandbox instead of the default bypass mode |
 | `--codex-reasoning-effort` | Override Codex reasoning effort: low, medium, high, or xhigh (default: xhigh) |
 | `--init`, `-i` | Initialize AI tools before review |
 | `--no-consolidate` | Skip consolidation phase |
-| `--consolidation-model` | AI model for consolidation phase: claude, gemini, codex, or codex-spark (default: codex-spark) |
+| `--consolidation-model` | AI model for consolidation phase: claude, gemini, codex, codex-spark, or opencode (default: codex-spark) |
 | `--base-ref` | Base ref for diff (default: origin/main) |
 | `--head-ref` | Head ref for diff (default: HEAD) |
 | `--custom-rules` | Custom review rules text to inject into the review prompt |
@@ -138,20 +145,20 @@ PR URL --> fetch_pr.py --clone --> cloned repo + context.json
                                          |
                                    run_review.py
                                          |
-                   +---------------------+---------------------+
-                   |                     |                     |
-             Codex CLI             Claude Code            Gemini CLI
-             (default)              (--claude)            (--gemini)
-                   |                     |                     |
-             codex_review           claude_review        gemini_review
-             .md/.html/.json        .md/.html/.json       .md/.html/.json
-                   +---------------------+---------------------+
+         +----------------+----------------+----------------+----------------+
+         |                |                |                |                |
+     Codex CLI       Claude Code       Gemini CLI        OpenCode
+     (default)        (--claude)        (--gemini)      (--opencode)
+         |                |                |                |
+   codex_review      claude_review     gemini_review    opencode_review
+   .md/.html/.json   .md/.html/.json   .md/.html/.json  .md/.html/.json
+         +----------------+----------------+----------------+----------------+
                                          |
                                 Consolidation Phase
                                 (Codex Spark validates by default
                                  with xhigh reasoning effort,
                                  use --consolidation-model to change,
-                                 including codex-spark)
+                                 including codex-spark and opencode)
                                          |
                                 final_report.md/html/json
 ```
@@ -165,8 +172,9 @@ When using `--init`, the system generates context files for each AI tool:
 | Claude Code | `CLAUDE.md` | Native `/init` command | Project instructions, coding style |
 | Gemini CLI | `GEMINI.md` | Prompt-based (non-interactive) | Project context, conventions |
 | Codex CLI | `AGENTS.md` | Prompt-based (non-interactive) | Agent behavior, project overview |
+| OpenCode | `AGENTS.md` | Prompt-based (non-interactive) | Shared project rules and agent behavior |
 
-**Note**: Claude Code has a built-in `/init` slash command that works non-interactively. Gemini and Codex have `/init` commands but they only work in interactive TUI mode ([Gemini #5435](https://github.com/google-gemini/gemini-cli/issues/5435), [Codex #4219](https://github.com/openai/codex/issues/4219)). For automation, we use prompts to generate the context files.
+**Note**: Claude Code has a built-in `/init` slash command that works non-interactively. Gemini and Codex have `/init` commands but they only work in interactive TUI mode ([Gemini #5435](https://github.com/google-gemini/gemini-cli/issues/5435), [Codex #4219](https://github.com/openai/codex/issues/4219)). OpenCode also uses `AGENTS.md`, so `run_review.py --init` generates that file via a non-interactive prompt path when needed. For automation, we use prompts to generate the context files.
 
 ### Output Files
 
@@ -179,6 +187,8 @@ review-output/
 ├── gemini_review.md/html/json # Gemini individual report
 ├── codex_output.txt           # Codex raw output (if enabled)
 ├── codex_review.md/html/json  # Codex individual report
+├── opencode_output.txt        # OpenCode raw output (if enabled)
+├── opencode_review.md/html/json # OpenCode individual report
 ├── consolidation_prompt.md    # Consolidation prompt
 ├── consolidation_output.txt   # Consolidation raw output
 └── final_report.md/html/json  # Final consolidated report
@@ -279,8 +289,9 @@ FIX:
 | Claude | `claude -p --output-format text --dangerously-skip-permissions "<prompt>"` | `--dangerously-skip-permissions` |
 | Gemini | `gemini -p "<prompt>" -y` | `-y` (YOLO mode) |
 | Codex | `codex exec --dangerously-bypass-approvals-and-sandbox -` | `--dangerously-bypass-approvals-and-sandbox` |
+| OpenCode | `opencode run --dangerously-skip-permissions "<prompt>"` | `--dangerously-skip-permissions` |
 
-**Note**: Codex reads the prompt from stdin via `-`. Gemini runs in headless mode via `-p/--prompt`, and Claude review prompts are passed as the final CLI argument in `-p` mode. Codex now bypasses its internal sandbox by default; pass `--codex-use-sandbox` to restore the older `--full-auto` mode. `run_review.py` now defaults `--codex-reasoning-effort` to `xhigh`, and consolidation defaults to `--consolidation-model codex-spark`, which maps to `gpt-5.3-codex-spark`. The review flow is constrained to the local checkout and should not need remote PR pages or web search.
+**Note**: Codex reads the prompt from stdin via `-`. Gemini, Claude, and OpenCode run headlessly by receiving the prompt as a CLI argument. Codex now bypasses its internal sandbox by default; pass `--codex-use-sandbox` to restore the older `--full-auto` mode. `run_review.py` now defaults `--codex-reasoning-effort` to `xhigh`, and consolidation defaults to `--consolidation-model codex-spark`, which maps to `gpt-5.3-codex-spark`. The review flow is constrained to the local checkout and should not need remote PR pages or web search.
 
 ## Timeouts
 

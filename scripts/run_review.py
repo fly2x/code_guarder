@@ -34,7 +34,7 @@ DEFAULT_CODEX_REASONING_EFFORT = "xhigh"
 @dataclass
 class AgentConfig:
     """Configuration for AI agent runners."""
-    name: str                      # Agent name (claude, gemini, codex)
+    name: str                      # Agent name (claude, gemini, codex, opencode)
     command: list[str]             # Command to execute
     color: str                     # ANSI color code
     cli_name: str                  # CLI executable name
@@ -53,6 +53,7 @@ class Colors:
     CLAUDE = '\033[38;5;99m'
     GEMINI = '\033[38;5;39m'
     CODEX = '\033[38;5;208m'
+    OPENCODE = '\033[38;5;45m'
     SUCCESS = '\033[32m'
     WARNING = '\033[33m'
     ERROR = '\033[31m'
@@ -275,6 +276,22 @@ def build_gemini_command(prompt: str) -> list[str]:
     return ['gemini', '-p', prompt, '-y']
 
 
+def build_opencode_command(
+    prompt: str,
+    *,
+    model: Optional[str] = None,
+    skip_permissions: bool = True,
+) -> list[str]:
+    """Build an OpenCode CLI command for non-interactive reviews."""
+    command = ['opencode', 'run']
+    if model:
+        command.extend(['--model', model])
+    if skip_permissions:
+        command.append('--dangerously-skip-permissions')
+    command.append(prompt)
+    return command
+
+
 def categorize_files(files: list[str]) -> dict:
     """Categorize files by type/directory."""
     categories = {
@@ -365,6 +382,51 @@ def load_custom_rules(
         rules_parts.append(f"### Override Rules\n\n{cli_rules.strip()}")
 
     return '\n\n---\n\n'.join(rules_parts)
+
+
+def build_agents_md_init_prompt(agent_name: str) -> str:
+    """Build a shared AGENTS.md initialization prompt for agent CLIs."""
+    return f"""Analyze this codebase and draft the contents of AGENTS.md for the project root.
+
+AGENTS.md is a configuration file that tells {agent_name} how to behave in this repository.
+
+The file should include:
+
+# Project Overview
+Brief description of what this project does.
+
+# Directory Structure
+Key directories and what they contain.
+
+# Tech Stack
+- Programming languages used
+- Frameworks and libraries
+- Build tools
+
+# Coding Conventions
+- Code style guidelines observed in the codebase
+- Naming conventions
+- File organization patterns
+
+# Build & Test Commands
+```bash
+# How to build
+# How to run tests
+```
+
+# Important Files
+List of key files to understand the codebase.
+
+---
+
+Now analyze the current directory structure and source files, then produce the complete AGENTS.md contents with the above sections filled in based on what you discover.
+
+Output rules:
+- Output raw AGENTS.md markdown only
+- Do not wrap the file in code fences
+- Do not add commentary before or after the file
+- Keep it concise but informative
+"""
 
 
 # =============================================================================
@@ -484,50 +546,7 @@ def init_codex(
         return False
 
     print_step("Initializing Codex context (generating AGENTS.md)...")
-
-    # Codex exec doesn't support /init slash command - use prompt instead.
-    # Ask for raw AGENTS.md contents and have the CLI persist the final message.
-    init_prompt = """Analyze this codebase and draft the contents of AGENTS.md for the project root.
-
-AGENTS.md is a configuration file that tells Codex how to behave in this repository.
-
-The file should include:
-
-# Project Overview
-Brief description of what this project does.
-
-# Directory Structure
-Key directories and what they contain.
-
-# Tech Stack
-- Programming languages used
-- Frameworks and libraries
-- Build tools
-
-# Coding Conventions
-- Code style guidelines observed in the codebase
-- Naming conventions
-- File organization patterns
-
-# Build & Test Commands
-```bash
-# How to build
-# How to run tests
-```
-
-# Important Files
-List of key files to understand the codebase.
-
----
-
-Now analyze the current directory structure and source files, then produce the complete AGENTS.md contents with the above sections filled in based on what you discover.
-
-Output rules:
-- Output raw AGENTS.md markdown only
-- Do not wrap the file in code fences
-- Do not add commentary before or after the file
-- Keep it concise but informative
-"""
+    init_prompt = build_agents_md_init_prompt("Codex")
 
     try:
         command = build_codex_command(
@@ -557,6 +576,48 @@ Output rules:
             return False
     except Exception as e:
         print_warning(f"Codex init failed: {e}")
+        return False
+
+
+def init_opencode(
+    repo_dir: Path,
+    model: Optional[str] = None,
+) -> bool:
+    """Initialize OpenCode context by generating AGENTS.md if not exists."""
+    agents_md = repo_dir / "AGENTS.md"
+    if agents_md.exists():
+        print_step(f"AGENTS.md already exists in {repo_dir}")
+        return True
+
+    if not shutil.which('opencode'):
+        print_warning("OpenCode CLI not found")
+        return False
+
+    print_step("Initializing OpenCode context (generating AGENTS.md)...")
+    init_prompt = build_agents_md_init_prompt("OpenCode")
+
+    try:
+        proc = subprocess.run(
+            build_opencode_command(init_prompt, model=model),
+            capture_output=True,
+            text=True,
+            cwd=repo_dir,
+            timeout=600
+        )
+        content = proc.stdout.strip()
+        if content:
+            agents_md.write_text(content + ("\n" if not content.endswith("\n") else ""))
+            print_success("AGENTS.md generated")
+            return True
+
+        print_warning("AGENTS.md was not generated")
+        if proc.stdout:
+            print_warning(f"stdout: {proc.stdout[:500]}")
+        if proc.stderr:
+            print_warning(f"stderr: {proc.stderr[:500]}")
+        return False
+    except Exception as e:
+        print_warning(f"OpenCode init failed: {e}")
         return False
 
 
@@ -638,11 +699,39 @@ Now analyze the current directory structure and source files, then write GEMINI.
         return False
 
 
+def init_agents_md(
+    repo_dir: Path,
+    *,
+    use_codex: bool,
+    use_opencode: bool,
+    codex_use_sandbox: bool = False,
+    codex_reasoning_effort: Optional[str] = DEFAULT_CODEX_REASONING_EFFORT,
+) -> bool:
+    """Initialize the shared AGENTS.md file for tools that consume it."""
+    agents_md = repo_dir / "AGENTS.md"
+    if agents_md.exists():
+        print_step(f"AGENTS.md already exists in {repo_dir}")
+        return True
+
+    if use_codex and init_codex(
+        repo_dir,
+        use_sandbox=codex_use_sandbox,
+        reasoning_effort=codex_reasoning_effort,
+    ):
+        return True
+
+    if use_opencode and init_opencode(repo_dir):
+        return True
+
+    return False
+
+
 def init_ai_tools(
     repo_dir: Path,
     use_claude: bool,
     use_gemini: bool,
     use_codex: bool,
+    use_opencode: bool,
     codex_use_sandbox: bool = False,
     codex_reasoning_effort: Optional[str] = DEFAULT_CODEX_REASONING_EFFORT,
 ) -> None:
@@ -654,13 +743,15 @@ def init_ai_tools(
         init_tasks.append(('claude', init_claude))
     if use_gemini:
         init_tasks.append(('gemini', init_gemini))
-    if use_codex:
+    if use_codex or use_opencode:
         init_tasks.append((
-            'codex',
-            lambda repo_dir: init_codex(
+            'agents',
+            lambda repo_dir: init_agents_md(
                 repo_dir,
-                use_sandbox=codex_use_sandbox,
-                reasoning_effort=codex_reasoning_effort,
+                use_codex=use_codex,
+                use_opencode=use_opencode,
+                codex_use_sandbox=codex_use_sandbox,
+                codex_reasoning_effort=codex_reasoning_effort,
             ),
         ))
 
@@ -848,6 +939,28 @@ def run_gemini_agent(repo_dir: Path, prompt: str, output_file: Path) -> tuple[Pa
         cli_name='gemini',
         not_found_msg="Gemini CLI not found",
         command_builder=build_gemini_command,
+        prompt_via_stdin=False,
+        timeout=1800
+    )
+
+    return run_agent_generic(repo_dir, prompt, output_file, config)
+
+
+def run_opencode_agent(
+    repo_dir: Path,
+    prompt: str,
+    output_file: Path,
+    model: Optional[str] = None,
+) -> tuple[Path, list[str]]:
+    """Run OpenCode CLI agent with real-time output streaming."""
+
+    config = AgentConfig(
+        name='OpenCode',
+        command=[],
+        color=Colors.OPENCODE,
+        cli_name='opencode',
+        not_found_msg="OpenCode CLI not found. Install with: npm install -g opencode-ai",
+        command_builder=lambda prompt: build_opencode_command(prompt, model=model),
         prompt_via_stdin=False,
         timeout=1800
     )
@@ -1226,7 +1339,8 @@ def run_consolidation(
         review_reports: Dictionary of reviewer -> report path
         context: Review context dict
         output_dir: Output directory
-        consolidation_model: Which AI to use for consolidation (claude|gemini|codex|codex-spark)
+        consolidation_model: Which AI to use for consolidation
+            (claude|gemini|codex|codex-spark|opencode)
     """
 
     print_header("Consolidating Review Reports")
@@ -1257,6 +1371,11 @@ def run_consolidation(
             use_sandbox=codex_use_sandbox,
             model=CODEX_SPARK_MODEL,
             reasoning_effort=codex_reasoning_effort,
+        )),
+        'opencode': ('OpenCode CLI', lambda repo_dir, prompt, output_file: run_opencode_agent(
+            repo_dir,
+            prompt,
+            output_file,
         )),
     }
 
@@ -1604,6 +1723,7 @@ def run_parallel_reviews(
     use_claude: bool = True,
     use_gemini: bool = False,
     use_codex: bool = False,
+    use_opencode: bool = False,
     codex_use_sandbox: bool = False,
     codex_reasoning_effort: Optional[str] = DEFAULT_CODEX_REASONING_EFFORT,
 ) -> dict[str, Path]:
@@ -1622,6 +1742,8 @@ def run_parallel_reviews(
         reviewers.append('gemini')
     if use_codex:
         reviewers.append('codex')
+    if use_opencode:
+        reviewers.append('opencode')
 
     print_step(f"Starting parallel reviews with: {', '.join(reviewers)}")
     print_step(f"Changed files: {context.get('changed_files_count', 0)}")
@@ -1644,6 +1766,8 @@ def run_parallel_reviews(
                 use_sandbox=codex_use_sandbox,
                 reasoning_effort=codex_reasoning_effort,
             )
+        elif reviewer == 'opencode':
+            result_file, _ = run_opencode_agent(repo_dir, prompt, output_file)
         else:
             return reviewer, None, []
 
@@ -1687,14 +1811,17 @@ Examples:
   # Codex only (default)
   %(prog)s ./repo --output ./review-output
 
+  # Codex + OpenCode in parallel
+  %(prog)s ./repo --opencode --output ./review-output
+
   # Initialize AI tools before review (generates CLAUDE.md, AGENTS.md, GEMINI.md)
-  %(prog)s ./repo --init --gemini --claude --output ./review-output
+  %(prog)s ./repo --init --gemini --claude --opencode --output ./review-output
 
   # Codex + Gemini in parallel
   %(prog)s ./repo --gemini --output ./review-output
 
-  # All three reviewers
-  %(prog)s ./repo --gemini --claude --output ./review-output
+  # All four reviewers
+  %(prog)s ./repo --gemini --claude --opencode --output ./review-output
 
   # With context file from fetch_pr.py
   %(prog)s --context ./workspace/review_context.json --gemini --output ./review-output
@@ -1705,6 +1832,7 @@ Examples:
 AI Tool Context Files:
   - Claude Code: CLAUDE.md (project instructions, coding style)
   - Codex CLI:   AGENTS.md (agent behavior, constraints)
+  - OpenCode:    AGENTS.md (shared project rules)
   - Gemini CLI:  GEMINI.md (project context, persona)
         """
     )
@@ -1718,6 +1846,8 @@ AI Tool Context Files:
                         help="Also run Gemini CLI review in parallel")
     parser.add_argument("--claude", action="store_true",
                         help="Also run Claude Code review in parallel")
+    parser.add_argument("--opencode", action="store_true",
+                        help="Also run OpenCode CLI review in parallel")
     parser.add_argument("--codex", "-x", action="store_true",
                         help="Explicitly enable Codex CLI review (default on)")
     parser.add_argument("--no-codex", action="store_true",
@@ -1737,7 +1867,7 @@ AI Tool Context Files:
     parser.add_argument("--head-ref", type=str, default="HEAD",
                         help="Head ref for diff (default: HEAD)")
     parser.add_argument("--consolidation-model", type=str, default=DEFAULT_CONSOLIDATION_MODEL,
-                        choices=['claude', 'gemini', 'codex', 'codex-spark'],
+                        choices=['claude', 'gemini', 'codex', 'codex-spark', 'opencode'],
                         help=f"AI model for consolidation phase (default: {DEFAULT_CONSOLIDATION_MODEL})")
     parser.add_argument("--custom-rules", type=str, default=None,
                         help="Custom review rules text to inject into the review prompt")
@@ -1762,6 +1892,7 @@ AI Tool Context Files:
 
     # Validate: at least one reviewer must be enabled
     use_gemini = args.gemini
+    use_opencode = args.opencode
 
     if args.codex_use_sandbox and args.codex_bypass_sandbox:
         print_error("Conflicting flags: --codex-use-sandbox and --codex-bypass-sandbox")
@@ -1779,8 +1910,8 @@ AI Tool Context Files:
         print_error("--comment-max-count must be at least 1")
         sys.exit(1)
 
-    if not use_claude and not use_gemini and not use_codex:
-        print_error("At least one reviewer must be enabled. Remove --no-codex or add --gemini/--claude")
+    if not use_claude and not use_gemini and not use_codex and not use_opencode:
+        print_error("At least one reviewer must be enabled. Remove --no-codex or add --gemini/--claude/--opencode")
         sys.exit(1)
 
     print_header("Multi-AI Code Review")
@@ -1853,6 +1984,7 @@ AI Tool Context Files:
             use_claude,
             use_gemini,
             use_codex,
+            use_opencode,
             codex_use_sandbox=args.codex_use_sandbox,
             codex_reasoning_effort=args.codex_reasoning_effort,
         )
@@ -1865,14 +1997,16 @@ AI Tool Context Files:
         use_claude=use_claude,
         use_gemini=use_gemini,
         use_codex=use_codex,
+        use_opencode=use_opencode,
         codex_use_sandbox=args.codex_use_sandbox,
         codex_reasoning_effort=args.codex_reasoning_effort,
     )
 
-    active_reviewers = [r for r in ['claude', 'gemini', 'codex']
+    active_reviewers = [r for r in ['claude', 'gemini', 'codex', 'opencode']
                         if (r == 'claude' and use_claude) or
                            (r == 'gemini' and use_gemini) or
-                           (r == 'codex' and use_codex)]
+                           (r == 'codex' and use_codex) or
+                           (r == 'opencode' and use_opencode)]
 
     # Phase 2: Consolidation (if multiple reviewers or explicitly requested)
     total_issues = sum(len(issues) for issues in all_issues.values())
