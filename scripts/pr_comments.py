@@ -41,6 +41,42 @@ URL_SCHEME_PATTERN = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*://")
 EMBEDDED_LOCATION_PATTERN = re.compile(
     r"^(?P<file>.+?):(?P<line>\d+(?:-\d+)?)(?::\d+)?$"
 )
+REVIEWER_DISPLAY_ALIASES = {
+    "codex": "X",
+    "claude": "A",
+    "gemini": "G",
+    "opencode": "O",
+}
+
+
+def _reviewer_display_name(reviewer: Any) -> str:
+    name = str(reviewer or "").strip()
+    normalized = re.sub(r"\s+", " ", name).lower()
+
+    if normalized.startswith("codex"):
+        return REVIEWER_DISPLAY_ALIASES["codex"]
+    if normalized.startswith("claude"):
+        return REVIEWER_DISPLAY_ALIASES["claude"]
+    if normalized.startswith("gemini"):
+        return REVIEWER_DISPLAY_ALIASES["gemini"]
+    if normalized.startswith("opencode") or normalized.startswith("open code"):
+        return REVIEWER_DISPLAY_ALIASES["opencode"]
+    return name or "unknown"
+
+
+def format_reviewers_display(reviewers: Any) -> str:
+    """Format reviewer names for reports/comments without changing stored values."""
+    if isinstance(reviewers, (list, tuple)):
+        return ", ".join(_reviewer_display_name(reviewer) for reviewer in reviewers)
+
+    reviewers_text = str(reviewers or "").strip()
+    if not reviewers_text:
+        return "unknown"
+
+    parts = [part.strip() for part in reviewers_text.split(",")]
+    if len(parts) > 1:
+        return ", ".join(_reviewer_display_name(part) for part in parts)
+    return _reviewer_display_name(reviewers_text)
 
 
 @dataclass
@@ -362,13 +398,14 @@ def render_comment_body(
     severity = issue.get("severity", "medium")
     confidence = issue.get("confidence", "likely")
     reviewers = issue.get("reviewers", "unknown")
+    reviewers_display = format_reviewers_display(reviewers)
     location = f"{issue.get('file', '')}:{get_issue_location_display(issue)}"
     lines = [
         f"[Code Guarder][{severity}][{confidence}] {issue.get('title', 'Issue')}",
         "",
         f"- Severity: `{severity}`",
         f"- Confidence: `{confidence}`",
-        f"- Reviewers: `{reviewers}`",
+        f"- Reviewers: `{reviewers_display}`",
         f"- Location: `{location}`",
     ]
 

@@ -515,5 +515,73 @@ class MainDefaultsTests(unittest.TestCase):
         self.assertFalse(mock_parallel.call_args.kwargs["use_codex"])
 
 
+class ReportReviewerDisplayTests(unittest.TestCase):
+    def test_generate_single_report_aliases_reviewer_in_visible_reports_only(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            context = {
+                "owner": "owner",
+                "repo": "repo",
+                "pr_id": "123",
+                "title": "Test PR",
+            }
+            issues = [
+                {
+                    "file": "src/main.py",
+                    "line": "7",
+                    "severity": "medium",
+                    "title": "Example issue",
+                    "problem": "Example problem.",
+                    "source": "opencode",
+                }
+            ]
+
+            md_path, html_path, json_path = run_review.generate_single_report(
+                issues, context, output_dir, "opencode"
+            )
+
+            self.assertIn("**Reviewer**: O", md_path.read_text())
+            html = html_path.read_text()
+            self.assertIn("Code Review: owner/repo#123 - O", html)
+            self.assertIn("Reviewer: O", html)
+            self.assertEqual(json.loads(json_path.read_text())[0]["source"], "opencode")
+
+    def test_generate_final_report_aliases_reviewers_in_visible_reports_only(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            context = {
+                "owner": "owner",
+                "repo": "repo",
+                "pr_id": "123",
+                "title": "Test PR",
+            }
+            issues = [
+                {
+                    "file": "src/main.py",
+                    "line": "1",
+                    "severity": "low",
+                    "confidence": "trusted",
+                    "title": "Example issue",
+                    "problem": "Example problem.",
+                    "reviewers": "codex, gemini",
+                }
+            ]
+
+            md_path, html_path, json_path = run_review.generate_final_report(
+                issues, context, output_dir, ["codex", "gemini", "opencode"]
+            )
+
+            md = md_path.read_text()
+            self.assertIn("- **Reviewers**: X, G, O", md)
+            self.assertIn("**Reviewers**: X, G | **置信度**: 可信", md)
+            html = html_path.read_text()
+            self.assertIn("Reviewers: X, G, O", html)
+            self.assertIn("Reviewers: X, G", html)
+
+            data = json.loads(json_path.read_text())
+            self.assertEqual(data["context"]["reviewers"], ["codex", "gemini", "opencode"])
+            self.assertEqual(data["issues"][0]["reviewers"], "codex, gemini")
+
+
 if __name__ == "__main__":
     unittest.main()

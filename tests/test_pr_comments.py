@@ -29,6 +29,7 @@ class CommentBodyTests(unittest.TestCase):
         self.assertIn("**Problem**", body)
         self.assertIn("**Code**", body)
         self.assertIn("**Suggested Fix**", body)
+        self.assertIn("- Reviewers: `X, G`", body)
         self.assertIn("code-guarder:fingerprint=deadbeefcafebabe", body)
 
     def test_render_comment_body_uses_reported_location_without_diff_metadata(self):
@@ -52,7 +53,7 @@ class CommentBodyTests(unittest.TestCase):
             resolved_old_line=2557,
         )
 
-        self.assertIn("- Reviewers: `CODEX`", body)
+        self.assertIn("- Reviewers: `X`", body)
         self.assertIn("- Location: `pki/cms/src/hitls_cms_signdata.c:2555-2560`", body)
         self.assertNotIn("Reported Location", body)
         self.assertNotIn("Diff Position", body)

@@ -1085,8 +1085,9 @@ def generate_single_report(issues: list[dict], context: dict, output_dir: Path, 
     issues.sort(key=lambda x: severity_order.get(x.get('severity', 'low'), 3))
 
     # Generate markdown
+    reviewer_display = pr_comments_module.format_reviewers_display(prefix)
     md_lines = [f"# Code Review: {owner}/{repo}#{pr_id}"]
-    md_lines.append(f"**Reviewer**: {prefix.upper()}\n")
+    md_lines.append(f"**Reviewer**: {reviewer_display}\n")
     if title:
         md_lines.append(f"**{title}**\n")
 
@@ -1143,7 +1144,7 @@ def generate_html_report(issues: list[dict], context: dict, reviewer: str = '') 
     repo = context.get('repo', '')
     pr_id = context.get('pr_id', '')
     title = context.get('title', '')
-    reviewer_title = f" - {reviewer.upper()}" if reviewer else ""
+    reviewer_title = f" - {pr_comments_module.format_reviewers_display(reviewer)}" if reviewer else ""
     empty_state = ""
     if not issues:
         empty_state = (
@@ -1202,7 +1203,7 @@ def generate_html_report(issues: list[dict], context: dict, reviewer: str = '') 
         for issue in group_issues:
             code = issue.get('code', '').replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
             fix = issue.get('fix', '').replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
-            source = issue.get('source', reviewer)
+            source = pr_comments_module.format_reviewers_display(issue.get('source', reviewer))
             html += f'''<div class="issue">
                 <div class="issue-title">{issue.get('title', 'Issue')}</div>
                 <div class="issue-location">{issue.get('file', '')}:{issue.get('line', '')}</div>
@@ -1474,6 +1475,7 @@ def generate_final_report(issues: list[dict], context: dict, output_dir: Path, r
         'medium': len([i for i in issues if i.get('severity') == 'medium']),
         'low': len([i for i in issues if i.get('severity') == 'low']),
     }
+    reviewers_display = pr_comments_module.format_reviewers_display(reviewers)
 
     # Generate markdown
     md_lines = [
@@ -1486,7 +1488,7 @@ def generate_final_report(issues: list[dict], context: dict, output_dir: Path, r
         f"- **High**: {stats['high']}",
         f"- **Medium**: {stats['medium']}",
         f"- **Low**: {stats['low']}",
-        f"- **Reviewers**: {', '.join(reviewers)}",
+        f"- **Reviewers**: {reviewers_display}",
         f"\n---\n"
     ]
 
@@ -1501,9 +1503,10 @@ def generate_final_report(issues: list[dict], context: dict, output_dir: Path, r
         md_lines.append(f"`{issue.get('file', '')}:{issue.get('line', '')}`")
 
         reviewers_list = issue.get('reviewers', issue.get('source', 'unknown'))
+        reviewers_list_display = pr_comments_module.format_reviewers_display(reviewers_list)
         confidence = issue.get('confidence', 'evaluate')
         confidence_label = get_confidence_label(confidence)
-        md_lines.append(f"**Reviewers**: {reviewers_list} | **置信度**: {confidence_label}")
+        md_lines.append(f"**Reviewers**: {reviewers_list_display} | **置信度**: {confidence_label}")
 
         if issue.get('code'):
             md_lines.append("```")
@@ -1554,6 +1557,7 @@ def generate_final_html_report(issues: list[dict], context: dict, stats: dict, r
     repo = context.get('repo', '')
     pr_id = context.get('pr_id', '')
     title = context.get('title', '')
+    reviewers_display = pr_comments_module.format_reviewers_display(reviewers)
 
     html = f'''<!DOCTYPE html>
 <html lang="zh-CN">
@@ -1613,7 +1617,7 @@ def generate_final_html_report(issues: list[dict], context: dict, stats: dict, r
             <div class="stat low"><div class="stat-value">{stats['low']}</div><div class="stat-label">Low</div></div>
         </div>
 
-        <div class="reviewers">Reviewers: {', '.join(reviewers)}</div>
+        <div class="reviewers">Reviewers: {reviewers_display}</div>
 '''
 
     severity_groups = {'critical': [], 'high': [], 'medium': [], 'low': []}
@@ -1630,7 +1634,9 @@ def generate_final_html_report(issues: list[dict], context: dict, stats: dict, r
         for issue in group_issues:
             code = issue.get('code', '').replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
             fix = issue.get('fix', '').replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
-            reviewers_str = issue.get('reviewers', issue.get('source', 'unknown'))
+            reviewers_str = pr_comments_module.format_reviewers_display(
+                issue.get('reviewers', issue.get('source', 'unknown'))
+            )
             confidence = issue.get('confidence', 'evaluate')
             confidence_label = get_confidence_label(confidence)
             html += f'''<div class="issue">
