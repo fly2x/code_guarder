@@ -4,7 +4,7 @@ Fetch PR/MR from GitHub, GitLab, Gitee, or GitCode.
 
 Supports two modes:
 1. Diff mode (default): Fetch diff text only
-2. Clone mode (--clone): Clone repo and checkout PR branch for agent review
+2. Clone mode (--clone): Clone repo and checkout PR change on the target branch
 
 Supported URL formats:
 - GitHub:  https://github.com/owner/repo/pull/123
@@ -107,6 +107,194 @@ def get_clean_env() -> dict:
     return env
 
 
+def _extract_branch_ref(value) -> str:
+    """Extract a branch/ref name from common API response shapes."""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, dict):
+        for key in ('ref', 'name', 'branch'):
+            ref = _extract_branch_ref(value.get(key))
+            if ref:
+                return ref
+    return ""
+
+
+def _get_nested(data: dict, path: str):
+    value = data
+    for part in path.split('.'):
+        if not isinstance(value, dict):
+            return None
+        value = value.get(part)
+    return value
+
+
+def _first_branch_ref(data: dict, paths: list[str]) -> str:
+    for path in paths:
+        ref = _extract_branch_ref(_get_nested(data, path))
+        if ref:
+            return ref
+    return ""
+
+
+def _extract_user_name(value) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, dict):
+        for key in ('login', 'username', 'name'):
+            user_name = _extract_user_name(value.get(key))
+            if user_name:
+                return user_name
+    return ""
+
+
+def _update_pr_from_metadata(pr: PRInfo, data: dict) -> None:
+    pr.title = data.get('title') or pr.title or ''
+    pr.author = (
+        _extract_user_name(data.get('author'))
+        or _extract_user_name(data.get('user'))
+        or pr.author
+    )
+    base_branch = _first_branch_ref(
+        data,
+        ['base.ref', 'base.name', 'target.ref', 'target.name', 'target_branch', 'base_branch'],
+    )
+    head_branch = _first_branch_ref(
+        data,
+        ['head.ref', 'head.name', 'source.ref', 'source.name', 'source_branch', 'head_branch'],
+    )
+    if base_branch:
+        pr.base_branch = base_branch
+    if head_branch:
+        pr.head_branch = head_branch
+
+
+def _git_ref_for_platform(pr: PRInfo) -> tuple[str, str]:
+    """Return the remote PR ref and local branch name used for review."""
+    if pr.platform == 'github':
+        return f"refs/pull/{pr.pr_id}/head", f"pr-{pr.pr_id}"
+    if pr.platform in ('gitlab', 'gitcode'):
+        return f"refs/merge-requests/{pr.pr_id}/head", f"mr-{pr.pr_id}"
+    if pr.platform == 'gitee':
+        return f"refs/pull/{pr.pr_id}/head", f"pr-{pr.pr_id}"
+    raise RuntimeError(f"Unsupported platform: {pr.platform}")
+
+
+def _target_remote_ref(base_branch: str) -> str:
+    return f"refs/remotes/origin/{base_branch}"
+
+
+def _target_tracking_ref(base_branch: str) -> str:
+    return f"origin/{base_branch}"
+
+
+def _ensure_git_identity(repo_dir: Path, env: dict) -> None:
+    """Cherry-pick creates commits, so configure a local fallback identity if needed."""
+    checks = [
+        ('user.email', 'code-guarder@example.invalid'),
+        ('user.name', 'Code Guarder'),
+    ]
+    for key, default_value in checks:
+        result = subprocess.run(
+            ['git', 'config', '--get', key],
+            cwd=repo_dir, env=env, capture_output=True, text=True
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            subprocess.run(
+                ['git', 'config', key, default_value],
+                cwd=repo_dir, env=env, check=True, capture_output=True
+            )
+
+
+def _fetch_target_branch(repo_dir: Path, env: dict, base_branch: str, quiet: bool = False) -> None:
+    subprocess.run(
+        [
+            'git', 'fetch', 'origin',
+            f"refs/heads/{base_branch}:{_target_remote_ref(base_branch)}",
+        ],
+        cwd=repo_dir, env=env, check=True,
+        capture_output=quiet, timeout=120
+    )
+
+
+def _prepare_cherry_pick_branch(
+    repo_dir: Path,
+    env: dict,
+    pr: PRInfo,
+    source_ref: str,
+    review_branch: str,
+    quiet: bool = False,
+) -> tuple[str, str]:
+    """
+    Recreate the PR change on top of the PR target branch.
+
+    Returns: (base_ref, head_ref), where both refs are local branches and can be
+    used directly by git diff.
+    """
+    base_branch = (pr.base_branch or 'main').strip()
+    if not base_branch:
+        base_branch = 'main'
+
+    try:
+        _fetch_target_branch(repo_dir, env, base_branch, quiet=quiet)
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(
+            f"Git fetch target branch '{base_branch}' failed "
+            f"(exit {e.returncode}): {e.stderr.decode() if e.stderr else 'unknown error'}"
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"Git fetch target branch '{base_branch}' timed out after 120 seconds")
+
+    base_remote_ref = _target_remote_ref(base_branch)
+
+    try:
+        subprocess.run(
+            ['git', 'checkout', '-B', base_branch, _target_tracking_ref(base_branch)],
+            cwd=repo_dir, env=env, check=True,
+            capture_output=quiet
+        )
+        subprocess.run(
+            ['git', 'checkout', '-B', review_branch, base_branch],
+            cwd=repo_dir, env=env, check=True,
+            capture_output=quiet
+        )
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"Git checkout target/review branch failed (exit {e.returncode}): {e.stderr.decode() if e.stderr else 'unknown error'}")
+
+    rev_list = subprocess.run(
+        ['git', 'rev-list', '--reverse', f'{base_remote_ref}..{source_ref}'],
+        cwd=repo_dir, env=env, capture_output=True, text=True
+    )
+    if rev_list.returncode != 0:
+        raise RuntimeError(f"Git rev-list PR commits failed: {rev_list.stderr.strip()}")
+
+    commits = [line.strip() for line in rev_list.stdout.splitlines() if line.strip()]
+    if commits:
+        _ensure_git_identity(repo_dir, env)
+        try:
+            subprocess.run(
+                ['git', 'cherry-pick', '--keep-redundant-commits', *commits],
+                cwd=repo_dir, env=env, check=True,
+                capture_output=quiet, timeout=300
+            )
+        except subprocess.CalledProcessError as e:
+            subprocess.run(
+                ['git', 'cherry-pick', '--abort'],
+                cwd=repo_dir, env=env, capture_output=True
+            )
+            raise RuntimeError(
+                f"Git cherry-pick PR commits onto target branch '{base_branch}' failed "
+                f"(exit {e.returncode}): {e.stderr.decode() if e.stderr else 'unknown error'}"
+            )
+        except subprocess.TimeoutExpired:
+            subprocess.run(
+                ['git', 'cherry-pick', '--abort'],
+                cwd=repo_dir, env=env, capture_output=True
+            )
+            raise RuntimeError("Git cherry-pick timed out after 300 seconds")
+
+    return base_branch, review_branch
+
+
 # =============================================================================
 # PR Metadata Fetching
 # =============================================================================
@@ -125,10 +313,7 @@ def fetch_pr_metadata(pr: PRInfo) -> PRInfo:
             req = urllib.request.Request(url, headers=headers)
             with urllib.request.urlopen(req, timeout=30) as response:
                 data = json.loads(response.read().decode('utf-8'))
-                pr.title = data.get('title', '')
-                pr.author = data.get('user', {}).get('login', '')
-                pr.base_branch = data.get('base', {}).get('ref', 'main')
-                pr.head_branch = data.get('head', {}).get('ref', '')
+                _update_pr_from_metadata(pr, data)
 
         elif pr.platform == 'gitlab':
             project_id = urllib.parse.quote(f"{pr.owner}/{pr.repo}", safe='')
@@ -139,10 +324,7 @@ def fetch_pr_metadata(pr: PRInfo) -> PRInfo:
             req = urllib.request.Request(url, headers=headers)
             with urllib.request.urlopen(req, timeout=30) as response:
                 data = json.loads(response.read().decode('utf-8'))
-                pr.title = data.get('title', '')
-                pr.author = data.get('author', {}).get('username', '')
-                pr.base_branch = data.get('target_branch', 'main')
-                pr.head_branch = data.get('source_branch', '')
+                _update_pr_from_metadata(pr, data)
 
         elif pr.platform == 'gitee':
             url = f"https://gitee.com/api/v5/repos/{pr.owner}/{pr.repo}/pulls/{pr.pr_id}"
@@ -151,22 +333,28 @@ def fetch_pr_metadata(pr: PRInfo) -> PRInfo:
             req = urllib.request.Request(url, headers={'User-Agent': 'code-guarder'})
             with urllib.request.urlopen(req, timeout=30) as response:
                 data = json.loads(response.read().decode('utf-8'))
-                pr.title = data.get('title', '')
-                pr.author = data.get('user', {}).get('login', '')
-                pr.base_branch = data.get('base', {}).get('ref', 'main')
-                pr.head_branch = data.get('head', {}).get('ref', '')
+                _update_pr_from_metadata(pr, data)
 
         elif pr.platform == 'gitcode':
+            headers = {'User-Agent': 'code-guarder', 'Accept': 'application/json'}
             if token:
-                url = f"https://gitcode.com/api/v5/repos/{pr.owner}/{pr.repo}/pulls/{pr.pr_id}"
-                headers = {'User-Agent': 'code-guarder', 'private-token': token}
-                req = urllib.request.Request(url, headers=headers)
-                with urllib.request.urlopen(req, timeout=30) as response:
-                    data = json.loads(response.read().decode('utf-8'))
-                    pr.title = data.get('title', '')
-                    pr.author = data.get('user', {}).get('login', '')
-                    pr.base_branch = data.get('base', {}).get('ref', 'main')
-                    pr.head_branch = data.get('head', {}).get('ref', '')
+                headers['private-token'] = token
+            last_error = None
+            for base_url in ('https://api.gitcode.com/api/v5', 'https://gitcode.com/api/v5'):
+                url = f"{base_url}/repos/{pr.owner}/{pr.repo}/pulls/{pr.pr_id}"
+                if token:
+                    url += f"?access_token={urllib.parse.quote(token)}"
+                try:
+                    req = urllib.request.Request(url, headers=headers)
+                    with urllib.request.urlopen(req, timeout=30) as response:
+                        data = json.loads(response.read().decode('utf-8'))
+                        _update_pr_from_metadata(pr, data)
+                        break
+                except (urllib.error.HTTPError, urllib.error.URLError, socket.timeout) as e:
+                    last_error = e
+            else:
+                if last_error:
+                    raise last_error
 
     except urllib.error.HTTPError as e:
         if e.code == 404:
@@ -190,7 +378,7 @@ def fetch_pr_metadata(pr: PRInfo) -> PRInfo:
 
 
 # =============================================================================
-# Clone Mode - Clone repo and checkout PR branch
+# Clone Mode - Clone repo and checkout target-based review branch
 # =============================================================================
 
 def create_git_credential_helper(platform: str, token: str) -> str:
@@ -214,7 +402,7 @@ def create_git_credential_helper(platform: str, token: str) -> str:
 
 def clone_pr_repo(pr: PRInfo, target_dir: Path, quiet: bool = False) -> Tuple[Path, str, str]:
     """
-    Clone repository and checkout PR branch.
+    Clone repository and checkout a branch with PR commits cherry-picked onto the PR target branch.
 
     Returns: (repo_path, base_ref, head_ref)
     Raises: RuntimeError on clone/fetch failures
@@ -254,38 +442,12 @@ def clone_pr_repo(pr: PRInfo, target_dir: Path, quiet: bool = False) -> Tuple[Pa
 
         # Fetch PR ref based on platform
         try:
-            if pr.platform == 'github':
-                # GitHub: refs/pull/{id}/head
-                pr_ref = f"refs/pull/{pr.pr_id}/head"
-                local_branch = f"pr-{pr.pr_id}"
-
-                subprocess.run(
-                    ['git', 'fetch', 'origin', f"{pr_ref}:{local_branch}"],
-                    cwd=repo_dir, env=env, check=True,
-                    capture_output=quiet, timeout=120
-                )
-
-            elif pr.platform == 'gitlab' or pr.platform == 'gitcode':
-                # GitLab/GitCode: refs/merge-requests/{id}/head
-                pr_ref = f"refs/merge-requests/{pr.pr_id}/head"
-                local_branch = f"mr-{pr.pr_id}"
-
-                subprocess.run(
-                    ['git', 'fetch', 'origin', f"{pr_ref}:{local_branch}"],
-                    cwd=repo_dir, env=env, check=True,
-                    capture_output=quiet, timeout=120
-                )
-
-            elif pr.platform == 'gitee':
-                # Gitee: refs/pull/{id}/head
-                pr_ref = f"refs/pull/{pr.pr_id}/head"
-                local_branch = f"pr-{pr.pr_id}"
-
-                subprocess.run(
-                    ['git', 'fetch', 'origin', f"{pr_ref}:{local_branch}"],
-                    cwd=repo_dir, env=env, check=True,
-                    capture_output=quiet, timeout=120
-                )
+            pr_ref, local_branch = _git_ref_for_platform(pr)
+            subprocess.run(
+                ['git', 'fetch', 'origin', f"{pr_ref}:{local_branch}"],
+                cwd=repo_dir, env=env, check=True,
+                capture_output=quiet, timeout=120
+            )
         except subprocess.CalledProcessError as e:
             shutil.rmtree(repo_dir, ignore_errors=True)
             raise RuntimeError(f"Git fetch PR ref failed (exit {e.returncode}): {e.stderr.decode() if e.stderr else 'unknown error'}")
@@ -293,7 +455,7 @@ def clone_pr_repo(pr: PRInfo, target_dir: Path, quiet: bool = False) -> Tuple[Pa
             shutil.rmtree(repo_dir, ignore_errors=True)
             raise RuntimeError("Git fetch timed out after 120 seconds")
 
-        # Ensure we have enough history for merge-base
+        # Ensure we have enough history for target-branch commit selection.
         try:
             subprocess.run(
                 ['git', 'fetch', '--deepen=200', 'origin', pr.base_branch],
@@ -304,35 +466,27 @@ def clone_pr_repo(pr: PRInfo, target_dir: Path, quiet: bool = False) -> Tuple[Pa
             # Non-fatal, continue with what we have
             pass
 
-        # Find merge base
-        merge_base_result = subprocess.run(
-            ['git', 'merge-base', f'origin/{pr.base_branch}', local_branch],
-            cwd=repo_dir, env=env,
-            capture_output=True, text=True
-        )
-
-        if merge_base_result.returncode == 0:
-            base_ref = merge_base_result.stdout.strip()
-        else:
-            base_ref = f'origin/{pr.base_branch}'
-
-        # Checkout PR branch
+        review_branch = f"{local_branch}-cherry-pick"
         try:
-            subprocess.run(
-                ['git', 'checkout', local_branch],
-                cwd=repo_dir, env=env, check=True,
-                capture_output=quiet
+            base_ref, head_ref = _prepare_cherry_pick_branch(
+                repo_dir,
+                env,
+                pr,
+                local_branch,
+                review_branch,
+                quiet=quiet,
             )
-        except subprocess.CalledProcessError as e:
+        except Exception:
             shutil.rmtree(repo_dir, ignore_errors=True)
-            raise RuntimeError(f"Git checkout failed (exit {e.returncode}): {e.stderr.decode() if e.stderr else 'unknown error'}")
+            raise
 
         if not quiet:
             print(f"Repository ready at: {repo_dir}", file=sys.stderr)
+            print(f"Target branch: {pr.base_branch}", file=sys.stderr)
             print(f"Base ref: {base_ref}", file=sys.stderr)
-            print(f"Head ref: {local_branch}", file=sys.stderr)
+            print(f"Head ref: {head_ref}", file=sys.stderr)
 
-        return repo_dir, base_ref, local_branch
+        return repo_dir, base_ref, head_ref
 
     finally:
         # Clean up credential helper
@@ -463,7 +617,7 @@ def fetch_gitee_diff(pr: PRInfo, token: Optional[str]) -> str:
 
 def fetch_gitcode_diff_via_git(pr: PRInfo) -> str:
     """Fetch GitCode diff using git."""
-    repo_url = f"https://gitcode.com/{pr.owner}/{pr.repo}.git"
+    repo_url = pr.clone_url or f"https://gitcode.com/{pr.owner}/{pr.repo}.git"
     mr_ref = f"refs/merge-requests/{pr.pr_id}/head"
     env = get_clean_env()
 
@@ -473,45 +627,32 @@ def fetch_gitcode_diff_via_git(pr: PRInfo) -> str:
         subprocess.run(['git', 'remote', 'add', 'origin', repo_url],
                        cwd=tmpdir, env=env, check=True, capture_output=True)
 
-        # Detect target branch
-        target_branch = 'main'
-        for branch in ['main', 'master', 'develop']:
-            check = subprocess.run(
-                ['git', 'ls-remote', '--heads', 'origin', branch],
-                cwd=tmpdir, env=env, capture_output=True, text=True, timeout=30
-            )
-            if check.returncode == 0 and check.stdout.strip():
-                target_branch = branch
-                break
-
-        # Fetch branches
+        # Fetch the MR head first. The target branch comes from PR metadata.
         subprocess.run(
             ['git', 'fetch', '--quiet', 'origin',
-             f'{mr_ref}:refs/remotes/origin/mr-head',
-             f'refs/heads/{target_branch}:refs/remotes/origin/{target_branch}'],
+             f'{mr_ref}:refs/remotes/origin/mr-head'],
             cwd=tmpdir, env=env, check=True,
             capture_output=True, text=True, timeout=300
         )
 
-        # Deepen if needed
+        # Deepen if needed for rev-list against the target branch.
         subprocess.run(
             ['git', 'fetch', '--quiet', '--deepen=500', 'origin'],
             cwd=tmpdir, env=env, capture_output=True, timeout=300
         )
 
-        # Find merge base
-        merge_base = subprocess.run(
-            ['git', 'merge-base',
-             f'refs/remotes/origin/{target_branch}',
-             'refs/remotes/origin/mr-head'],
-            cwd=tmpdir, env=env, capture_output=True, text=True
+        base_ref, head_ref = _prepare_cherry_pick_branch(
+            Path(tmpdir),
+            env,
+            pr,
+            'refs/remotes/origin/mr-head',
+            f"mr-{pr.pr_id}-cherry-pick",
+            quiet=True,
         )
 
-        base_ref = merge_base.stdout.strip() if merge_base.returncode == 0 else f'refs/remotes/origin/{target_branch}'
-
-        # Generate diff
+        # Generate diff between the PR target branch and the cherry-picked branch.
         diff_result = subprocess.run(
-            ['git', 'diff', base_ref, 'refs/remotes/origin/mr-head'],
+            ['git', 'diff', base_ref, head_ref],
             cwd=tmpdir, env=env, capture_output=True, text=True, timeout=120
         )
 
@@ -560,7 +701,7 @@ def main():
         epilog="""
 Modes:
   Diff mode (default):  Fetch diff text only
-  Clone mode (--clone): Clone repo and checkout PR branch for agent review
+  Clone mode (--clone): Clone repo and checkout PR change on target branch
 
 Examples:
   # Diff mode - get diff text

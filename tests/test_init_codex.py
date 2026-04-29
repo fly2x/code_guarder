@@ -516,6 +516,28 @@ class MainDefaultsTests(unittest.TestCase):
 
 
 class ReportReviewerDisplayTests(unittest.TestCase):
+    def test_parse_issues_normalizes_repo_absolute_paths(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_dir = Path(tmpdir) / "repo"
+            file_path = repo_dir / "src" / "main.py"
+            file_path.parent.mkdir(parents=True)
+            file_path.write_text("print('hello')\n")
+            content = "\n".join(
+                [
+                    "===ISSUE===",
+                    f"FILE: {file_path}:7",
+                    "SEVERITY: medium",
+                    "TITLE: Example issue",
+                    "PROBLEM: Example problem.",
+                    "===END===",
+                ]
+            )
+
+            issues = run_review.parse_issues(content, source="codex", repo_dir=repo_dir)
+
+            self.assertEqual(issues[0]["file"], "src/main.py")
+            self.assertEqual(issues[0]["line"], "7")
+
     def test_generate_single_report_aliases_reviewer_in_visible_reports_only(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             output_dir = Path(tmpdir)
@@ -545,6 +567,47 @@ class ReportReviewerDisplayTests(unittest.TestCase):
             self.assertIn("Code Review: owner/repo#123 - O", html)
             self.assertIn("Reviewer: O", html)
             self.assertEqual(json.loads(json_path.read_text())[0]["source"], "opencode")
+
+    def test_generate_single_report_uses_repo_relative_locations(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            repo_dir = tmpdir_path / "repo"
+            output_dir = tmpdir_path / "out"
+            file_path = repo_dir / "src" / "main.py"
+            file_path.parent.mkdir(parents=True)
+            output_dir.mkdir()
+            file_path.write_text("print('hello')\n")
+            context = {
+                "owner": "owner",
+                "repo": "repo",
+                "pr_id": "123",
+                "title": "Test PR",
+                "repo_dir": str(repo_dir),
+            }
+            issues = [
+                {
+                    "file": str(file_path),
+                    "line": "7",
+                    "severity": "medium",
+                    "title": "Example issue",
+                    "problem": "Example problem.",
+                    "source": "codex",
+                }
+            ]
+
+            md_path, html_path, json_path = run_review.generate_single_report(
+                issues, context, output_dir, "codex"
+            )
+
+            md = md_path.read_text()
+            html = html_path.read_text()
+            data = json.loads(json_path.read_text())
+            self.assertIn("`src/main.py:7`", md)
+            self.assertNotIn(str(repo_dir), md)
+            self.assertIn("src/main.py:7", html)
+            self.assertNotIn(str(repo_dir), html)
+            self.assertEqual(data[0]["file"], "src/main.py")
+            self.assertEqual(data[0]["line"], "7")
 
     def test_generate_final_report_aliases_reviewers_in_visible_reports_only(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -581,6 +644,47 @@ class ReportReviewerDisplayTests(unittest.TestCase):
             data = json.loads(json_path.read_text())
             self.assertEqual(data["context"]["reviewers"], ["codex", "gemini", "opencode"])
             self.assertEqual(data["issues"][0]["reviewers"], "codex, gemini")
+
+    def test_generate_final_report_uses_repo_relative_locations_from_markdown_links(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            repo_dir = tmpdir_path / "repo"
+            output_dir = tmpdir_path / "out"
+            file_path = repo_dir / "src" / "main.py"
+            file_path.parent.mkdir(parents=True)
+            output_dir.mkdir()
+            file_path.write_text("print('hello')\n")
+            context = {
+                "owner": "owner",
+                "repo": "repo",
+                "pr_id": "123",
+                "title": "Test PR",
+                "repo_dir": str(repo_dir),
+            }
+            issues = [
+                {
+                    "file": f"[src/main.py](<{file_path}:12>)",
+                    "severity": "low",
+                    "confidence": "trusted",
+                    "title": "Example issue",
+                    "problem": "Example problem.",
+                    "reviewers": "codex",
+                }
+            ]
+
+            md_path, html_path, json_path = run_review.generate_final_report(
+                issues, context, output_dir, ["codex"]
+            )
+
+            md = md_path.read_text()
+            html = html_path.read_text()
+            data = json.loads(json_path.read_text())
+            self.assertIn("`src/main.py:12`", md)
+            self.assertNotIn(str(repo_dir), md)
+            self.assertIn("src/main.py:12", html)
+            self.assertNotIn(str(repo_dir), html)
+            self.assertEqual(data["issues"][0]["file"], "src/main.py")
+            self.assertEqual(data["issues"][0]["line"], "12")
 
 
 if __name__ == "__main__":

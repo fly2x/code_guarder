@@ -90,6 +90,26 @@ python3 scripts/run_review.py --context ./workspace/review_context.json --gemini
 python3 scripts/run_review.py --context ./workspace/review_context.json --gemini --consolidation-model codex-spark --codex-reasoning-effort xhigh -o ./review-output
 ```
 
+### GitCode One-Click Review
+
+```bash
+# Runs fetch_pr.py --clone, copies ./openhitls/hitls4j/*.md if present,
+# then runs run_review.py --init --opencode --publish-comments.
+python3 scripts/gitcode_review.py openHiTLS/hitls4j 35
+
+# Equivalent split-argument form
+python3 scripts/gitcode_review.py openHiTLS hitls4j 35
+```
+
+Default layout for `openHiTLS/hitls4j` PR `35`:
+
+| Path | Default |
+|------|---------|
+| Clone workspace | `./openhitls/hitls4j-35` |
+| Source checkout | `./openhitls/hitls4j-35/hitls4j` |
+| Markdown source | `./openhitls/hitls4j/*.md` |
+| Review output | `./openhitls/hitls4j-35/pr-35` |
+
 ### Command Line Options
 
 | Option | Description |
@@ -280,6 +300,7 @@ FIX:
 | Script | Purpose |
 |--------|---------|
 | `scripts/fetch_pr.py` | Clone repos or fetch diffs from GitHub/GitLab/Gitee/GitCode |
+| `scripts/gitcode_review.py` | One-click GitCode PR clone, markdown sync, review, and comment publishing |
 | `scripts/run_review.py` | Multi-AI review orchestrator with consolidation |
 
 ## AI Tool Commands

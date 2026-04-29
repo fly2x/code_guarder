@@ -190,7 +190,7 @@ Your ONLY output should be ===ISSUE=== blocks. No introduction, no conclusion.
 For each issue found, output EXACTLY:
 
 ===ISSUE===
-FILE: <filepath>
+FILE: <repo-relative filepath>
 LINE: <line number or range>
 SEVERITY: critical|high|medium|low
 TITLE: <concise title>
@@ -210,6 +210,7 @@ FIX:
 - ONLY output ===ISSUE=== blocks, nothing else
 - Do NOT write summaries or conclusions
 - Do NOT use markdown headers or bullet points outside of issue blocks
+- Use repository-relative paths in FILE; do NOT output absolute local filesystem paths
 - Only flag issues in CHANGED lines (code or docs, not pre-existing issues)
 - Be specific with line numbers
 - Provide working fixes, not just descriptions
@@ -1026,7 +1027,36 @@ def run_codex_review_agent(
 # Issue Parsing and Report Generation
 # =============================================================================
 
-def parse_issues(content: str, source: str = 'claude') -> list[dict]:
+def _context_repo_dir(context: dict | None) -> Path | None:
+    repo_dir_value = (context or {}).get('repo_dir')
+    return Path(repo_dir_value) if repo_dir_value else None
+
+
+def _normalize_issue_location(issue: dict, repo_dir: Path | None = None) -> dict:
+    normalized = dict(issue)
+    file_value, line_value = pr_comments_module.split_issue_location(
+        normalized.get('file'),
+        normalized.get('line'),
+    )
+    if file_value:
+        normalized['file'] = pr_comments_module.normalize_path(file_value, repo_dir=repo_dir)
+    if line_value:
+        normalized['line'] = str(line_value).strip()
+    elif 'line' in normalized:
+        normalized['line'] = str(normalized.get('line') or '').strip()
+    return normalized
+
+
+def _normalize_report_issue_locations(issues: list[dict], context: dict | None) -> list[dict]:
+    repo_dir = _context_repo_dir(context)
+    return [_normalize_issue_location(issue, repo_dir=repo_dir) for issue in issues]
+
+
+def parse_issues(
+    content: str,
+    source: str = 'claude',
+    repo_dir: Path | None = None,
+) -> list[dict]:
     """Parse issues from agent output."""
     import re
 
@@ -1039,14 +1069,22 @@ def parse_issues(content: str, source: str = 'claude') -> list[dict]:
             block = block[:end_match.start()]
 
         issue = {'source': source}
+        file_value = ""
+        line_value = ""
 
         file_match = re.search(r'FILE:\s*(.+?)(?:\n|$)', block)
         if file_match:
-            issue['file'] = file_match.group(1).strip()
+            file_value = file_match.group(1).strip()
 
         line_match = re.search(r'LINE:\s*(\d+(?:-\d+)?)', block)
         if line_match:
-            issue['line'] = line_match.group(1).strip()
+            line_value = line_match.group(1).strip()
+
+        file_value, line_value = pr_comments_module.split_issue_location(file_value, line_value)
+        if file_value:
+            issue['file'] = pr_comments_module.normalize_path(file_value, repo_dir=repo_dir)
+        if line_value:
+            issue['line'] = line_value
 
         severity_match = re.search(r'SEVERITY:\s*(critical|high|medium|low)', block, re.I)
         if severity_match:
@@ -1079,6 +1117,7 @@ def generate_single_report(issues: list[dict], context: dict, output_dir: Path, 
     pr_id = context.get('pr_id', '')
     title = context.get('title', '')
     raw_output_path = output_dir / f"{prefix}_output.txt"
+    issues = _normalize_report_issue_locations(issues, context)
 
     # Sort by severity
     severity_order = {'critical': 0, 'high': 1, 'medium': 2, 'low': 3}
@@ -1140,6 +1179,7 @@ def generate_single_report(issues: list[dict], context: dict, output_dir: Path, 
 
 def generate_html_report(issues: list[dict], context: dict, reviewer: str = '') -> str:
     """Generate HTML report."""
+    issues = _normalize_report_issue_locations(issues, context)
     owner = context.get('owner', '')
     repo = context.get('repo', '')
     pr_id = context.get('pr_id', '')
@@ -1281,7 +1321,7 @@ You are consolidating change review findings from multiple AI reviewers.
 For each validated issue, output:
 
 ===ISSUE===
-FILE: <filepath>
+FILE: <repo-relative filepath>
 LINE: <line number or range>
 SEVERITY: critical|high|medium|low
 TITLE: <concise title>
@@ -1308,6 +1348,7 @@ FIX:
 
 - SEVERITY indicates impact level (critical/high/medium/low)
 - CONFIDENCE indicates how certain we are about this issue
+- Use repository-relative paths in FILE; do NOT output absolute local filesystem paths
 - Only include issues you've verified in the changed files (code or docs)
 - Prefer fixes that are most complete and correct
 - Add REVIEWERS field showing which AIs found this issue
@@ -1462,6 +1503,7 @@ def generate_final_report(issues: list[dict], context: dict, output_dir: Path, r
     repo = context.get('repo', '')
     pr_id = context.get('pr_id', '')
     title = context.get('title', '')
+    issues = _normalize_report_issue_locations(issues, context)
 
     # Sort by severity
     severity_order = {'critical': 0, 'high': 1, 'medium': 2, 'low': 3}
@@ -1553,6 +1595,7 @@ def generate_final_report(issues: list[dict], context: dict, output_dir: Path, r
 
 def generate_final_html_report(issues: list[dict], context: dict, stats: dict, reviewers: list[str]) -> str:
     """Generate final HTML report with statistics."""
+    issues = _normalize_report_issue_locations(issues, context)
     owner = context.get('owner', '')
     repo = context.get('repo', '')
     pr_id = context.get('pr_id', '')
@@ -1656,7 +1699,10 @@ def generate_final_html_report(issues: list[dict], context: dict, stats: dict, r
     return html
 
 
-def parse_consolidated_issues(content: str) -> list[dict]:
+def parse_consolidated_issues(
+    content: str,
+    repo_dir: Path | None = None,
+) -> list[dict]:
     """Parse issues from consolidation output with additional fields."""
     import re
 
@@ -1682,7 +1728,7 @@ def parse_consolidated_issues(content: str) -> list[dict]:
 
         file_value, line_value = pr_comments_module.split_issue_location(file_value, line_value)
         if file_value:
-            issue['file'] = pr_comments_module.normalize_path(file_value)
+            issue['file'] = pr_comments_module.normalize_path(file_value, repo_dir=repo_dir)
         if line_value:
             issue['line'] = line_value
 
@@ -1780,7 +1826,7 @@ def run_parallel_reviews(
         # Parse issues
         if result_file.exists() and result_file.stat().st_size > 0:
             content = result_file.read_text()
-            issues = parse_issues(content, source=reviewer)
+            issues = parse_issues(content, source=reviewer, repo_dir=repo_dir)
             report_path = output_dir / f"{reviewer}_review.md"
 
             # Generate individual report
@@ -2033,7 +2079,7 @@ AI Tool Context Files:
         consolidated_issues = []
         if consolidation_output.exists() and consolidation_output.stat().st_size > 0:
             content = consolidation_output.read_text()
-            consolidated_issues = parse_consolidated_issues(content)
+            consolidated_issues = parse_consolidated_issues(content, repo_dir=repo_dir)
 
         if consolidated_issues:
             final_issues = consolidated_issues
