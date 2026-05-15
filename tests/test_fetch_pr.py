@@ -127,35 +127,91 @@ def create_remote_with_conflicting_pr(tmpdir: Path) -> Path:
     return origin
 
 
+def create_remote_with_resolved_conflict_merge_pr(tmpdir: Path) -> Path:
+    source = tmpdir / "source"
+    origin = tmpdir / "origin.git"
+    source.mkdir()
+
+    git(source, "init")
+    git(source, "config", "user.email", "test@example.com")
+    git(source, "config", "user.name", "Test User")
+
+    write_file(source / "conflict.txt", "base\n")
+    git(source, "add", "conflict.txt")
+    git(source, "commit", "-m", "initial main")
+    git(source, "branch", "-M", "main")
+
+    git(source, "checkout", "-b", "br-0.3")
+    write_file(source / "conflict.txt", "target\n")
+    git(source, "add", "conflict.txt")
+    git(source, "commit", "-m", "target change")
+
+    git(source, "checkout", "main")
+    git(source, "checkout", "-b", "contributor")
+    write_file(source / "conflict.txt", "feature\n")
+    git(source, "add", "conflict.txt")
+    git(source, "commit", "-m", "pr change")
+
+    merge = subprocess.run(
+        ["git", "merge", "br-0.3"],
+        cwd=source,
+        capture_output=True,
+        text=True,
+    )
+    if merge.returncode == 0:
+        raise RuntimeError("Expected merge conflict while preparing test repository")
+    write_file(source / "conflict.txt", "resolved\n")
+    git(source, "add", "conflict.txt")
+    git(source, "commit", "-m", "merge target with manual resolution")
+
+    git(tmpdir, "init", "--bare", str(origin))
+    git(source, "remote", "add", "origin", str(origin))
+    git(source, "push", "origin", "main")
+    git(source, "push", "origin", "br-0.3")
+    git(source, "push", "origin", "contributor:refs/merge-requests/11/head")
+    return origin
+
+
 class FetchPrTargetBranchTests(unittest.TestCase):
-    def test_clone_pr_repo_cherry_picks_onto_pr_target_branch(self):
+    def test_clone_pr_repo_merges_onto_pr_target_branch(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmpdir_path = Path(tmpdir)
             origin = create_remote_with_non_main_target(tmpdir_path)
-            workspace = tmpdir_path / "workspace"
-            workspace.mkdir()
-            pr = fetch_pr.PRInfo(
-                platform="github",
-                owner="owner",
-                repo="repo",
-                pr_id="7",
-                url="https://github.com/owner/repo/pull/7",
-                base_branch="br-0.3",
-                clone_url=str(origin),
-            )
+            cases = [
+                ("github", "7", "https://github.com/owner/repo/pull/7", "pr-7-review"),
+                ("gitlab", "8", "https://gitlab.com/owner/repo/-/merge_requests/8", "mr-8-review"),
+                ("gitee", "7", "https://gitee.com/owner/repo/pulls/7", "pr-7-review"),
+            ]
 
-            repo_dir, base_ref, head_ref = fetch_pr.clone_pr_repo(pr, workspace, quiet=True)
+            for platform, pr_id, url, expected_head in cases:
+                with self.subTest(platform=platform):
+                    workspace = tmpdir_path / f"workspace-{platform}"
+                    workspace.mkdir()
+                    pr = fetch_pr.PRInfo(
+                        platform=platform,
+                        owner="owner",
+                        repo="repo",
+                        pr_id=pr_id,
+                        url=url,
+                        base_branch="br-0.3",
+                        clone_url=str(origin),
+                    )
 
-            self.assertEqual(base_ref, "br-0.3")
-            self.assertEqual(head_ref, "pr-7-cherry-pick")
-            self.assertEqual(git(repo_dir, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip(), head_ref)
-            self.assertEqual(fetch_pr.get_changed_files(repo_dir, base_ref, head_ref), ["feature.txt"])
-            self.assertEqual(
-                git(repo_dir, "merge-base", base_ref, head_ref).stdout.strip(),
-                git(repo_dir, "rev-parse", base_ref).stdout.strip(),
-            )
+                    repo_dir, base_ref, head_ref, merge_status = fetch_pr.clone_pr_repo(
+                        pr, workspace, quiet=True, include_merge_status=True
+                    )
 
-    def test_clone_pr_repo_cherry_picks_merge_commits(self):
+                    self.assertEqual(base_ref, "br-0.3")
+                    self.assertEqual(head_ref, expected_head)
+                    self.assertEqual(merge_status, "merged")
+                    self.assertEqual(git(repo_dir, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip(), head_ref)
+                    self.assertEqual(fetch_pr.get_changed_files(repo_dir, base_ref, head_ref), ["feature.txt"])
+                    self.assertEqual(
+                        git(repo_dir, "merge-base", base_ref, head_ref).stdout.strip(),
+                        git(repo_dir, "rev-parse", base_ref).stdout.strip(),
+                    )
+
+    def test_clone_pr_repo_merges_pr_with_target_branch_merge_commits(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmpdir_path = Path(tmpdir)
             origin = create_remote_with_merge_commit_pr(tmpdir_path)
@@ -171,14 +227,16 @@ class FetchPrTargetBranchTests(unittest.TestCase):
                 clone_url=str(origin),
             )
 
-            repo_dir, base_ref, head_ref = fetch_pr.clone_pr_repo(pr, workspace, quiet=True)
-
-            self.assertEqual(fetch_pr.get_changed_files(repo_dir, base_ref, head_ref), ["feature.txt"])
-            self.assertFalse(
-                fetch_pr._cherry_pick_state_path(repo_dir, fetch_pr.get_clean_env()).exists()
+            repo_dir, base_ref, head_ref, merge_status = fetch_pr.clone_pr_repo(
+                pr, workspace, quiet=True, include_merge_status=True
             )
 
-    def test_clone_pr_repo_preserves_repo_and_continues_after_conflict(self):
+            self.assertEqual(base_ref, "br-0.3")
+            self.assertEqual(head_ref, "pr-9-review")
+            self.assertEqual(merge_status, "merged")
+            self.assertEqual(fetch_pr.get_changed_files(repo_dir, base_ref, head_ref), ["feature.txt"])
+
+    def test_clone_pr_repo_falls_back_to_merge_base_diff_after_merge_conflict(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmpdir_path = Path(tmpdir)
             origin = create_remote_with_conflicting_pr(tmpdir_path)
@@ -194,27 +252,15 @@ class FetchPrTargetBranchTests(unittest.TestCase):
                 clone_url=str(origin),
             )
 
-            with self.assertRaises(RuntimeError):
-                fetch_pr.clone_pr_repo(pr, workspace, quiet=True)
-
-            repo_dir = workspace / "repo"
-            self.assertTrue((repo_dir / ".git").exists())
-            self.assertTrue(
-                fetch_pr._cherry_pick_head_path(repo_dir, fetch_pr.get_clean_env()).exists()
+            repo_dir, base_ref, head_ref, merge_status = fetch_pr.clone_pr_repo(
+                pr, workspace, quiet=True, include_merge_status=True
             )
 
-            write_file(repo_dir / "conflict.txt", "manual resolution\n")
-            git(repo_dir, "add", "conflict.txt")
-
-            repo_dir, base_ref, head_ref = fetch_pr.clone_pr_repo(pr, workspace, quiet=True)
-
-            self.assertEqual(base_ref, "br-0.3")
-            self.assertEqual(head_ref, "pr-10-cherry-pick")
+            self.assertEqual(head_ref, "pr-10-review")
+            self.assertEqual(merge_status, "conflict_fallback")
             self.assertEqual(fetch_pr.get_changed_files(repo_dir, base_ref, head_ref), ["conflict.txt"])
-            self.assertEqual((repo_dir / "conflict.txt").read_text(), "manual resolution\n")
-            self.assertFalse(
-                fetch_pr._cherry_pick_state_path(repo_dir, fetch_pr.get_clean_env()).exists()
-            )
+            self.assertEqual((repo_dir / "conflict.txt").read_text(), "feature\n")
+            self.assertEqual(git(repo_dir, "status", "--porcelain").stdout, "")
 
     def test_gitcode_diff_uses_pr_target_branch_not_main(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -234,6 +280,37 @@ class FetchPrTargetBranchTests(unittest.TestCase):
 
             self.assertIn("diff --git a/feature.txt b/feature.txt", diff)
             self.assertNotIn("target.txt", diff)
+
+    def test_gitcode_clone_merges_pr_head_with_resolved_conflict_merge(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            origin = create_remote_with_resolved_conflict_merge_pr(tmpdir_path)
+            workspace = tmpdir_path / "workspace"
+            workspace.mkdir()
+            pr = fetch_pr.PRInfo(
+                platform="gitcode",
+                owner="owner",
+                repo="repo",
+                pr_id="11",
+                url="https://gitcode.com/owner/repo/pull/11",
+                base_branch="br-0.3",
+                clone_url=str(origin),
+            )
+
+            self.assertEqual(
+                fetch_pr._git_ref_for_platform(pr),
+                ("refs/merge-requests/11/head", "pr_11"),
+            )
+
+            repo_dir, base_ref, head_ref, merge_status = fetch_pr.clone_pr_repo(
+                pr, workspace, quiet=True, include_merge_status=True
+            )
+
+            self.assertEqual(base_ref, "br-0.3")
+            self.assertEqual(head_ref, "pr_11-review")
+            self.assertEqual(merge_status, "merged")
+            self.assertEqual(fetch_pr.get_changed_files(repo_dir, base_ref, head_ref), ["conflict.txt"])
+            self.assertEqual((repo_dir / "conflict.txt").read_text(), "resolved\n")
 
     def test_metadata_parser_accepts_target_branch_fields(self):
         pr = fetch_pr.PRInfo(
