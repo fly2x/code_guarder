@@ -26,7 +26,7 @@ import urllib.error
 import urllib.parse
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 
 @dataclass
@@ -171,8 +171,10 @@ def _git_ref_for_platform(pr: PRInfo) -> tuple[str, str]:
     """Return the remote PR ref and local branch name used for review."""
     if pr.platform == 'github':
         return f"refs/pull/{pr.pr_id}/head", f"pr-{pr.pr_id}"
-    if pr.platform in ('gitlab', 'gitcode'):
+    if pr.platform == 'gitlab':
         return f"refs/merge-requests/{pr.pr_id}/head", f"mr-{pr.pr_id}"
+    if pr.platform == 'gitcode':
+        return f"refs/merge-requests/{pr.pr_id}/head", f"pr_{pr.pr_id}"
     if pr.platform == 'gitee':
         return f"refs/pull/{pr.pr_id}/head", f"pr-{pr.pr_id}"
     raise RuntimeError(f"Unsupported platform: {pr.platform}")
@@ -187,7 +189,7 @@ def _target_tracking_ref(base_branch: str) -> str:
 
 
 def _ensure_git_identity(repo_dir: Path, env: dict) -> None:
-    """Cherry-pick creates commits, so configure a local fallback identity if needed."""
+    """Merge creates commits, so configure a local fallback identity if needed."""
     checks = [
         ('user.email', 'code-guarder@example.invalid'),
         ('user.name', 'Code Guarder'),
@@ -213,185 +215,6 @@ def _git_stdout(repo_dir: Path, env: dict, args: list[str]) -> str:
     return result.stdout.strip()
 
 
-def _git_path(repo_dir: Path, env: dict, path: str) -> Path:
-    git_path = _git_stdout(repo_dir, env, ['rev-parse', '--git-path', path])
-    result = Path(git_path)
-    if not result.is_absolute():
-        result = repo_dir / result
-    return result
-
-
-def _cherry_pick_state_path(repo_dir: Path, env: dict) -> Path:
-    return _git_path(repo_dir, env, 'code-guarder-fetch-pr-state.json')
-
-
-def _cherry_pick_head_path(repo_dir: Path, env: dict) -> Path:
-    return _git_path(repo_dir, env, 'CHERRY_PICK_HEAD')
-
-
-def _load_cherry_pick_state(repo_dir: Path, env: dict, review_branch: str) -> Optional[dict]:
-    state_path = _cherry_pick_state_path(repo_dir, env)
-    if not state_path.exists():
-        return None
-    try:
-        state = json.loads(state_path.read_text())
-    except (OSError, json.JSONDecodeError):
-        return None
-    if state.get('review_branch') != review_branch:
-        return None
-    return state
-
-
-def _save_cherry_pick_state(repo_dir: Path, env: dict, state: dict) -> None:
-    state_path = _cherry_pick_state_path(repo_dir, env)
-    state_path.write_text(json.dumps(state, indent=2))
-
-
-def _clear_cherry_pick_state(repo_dir: Path, env: dict) -> None:
-    state_path = _cherry_pick_state_path(repo_dir, env)
-    try:
-        state_path.unlink()
-    except FileNotFoundError:
-        pass
-
-
-def _commit_parents(repo_dir: Path, env: dict, commit: str) -> list[str]:
-    line = _git_stdout(repo_dir, env, ['rev-list', '--parents', '-n', '1', commit])
-    parts = line.split()
-    return parts[1:]
-
-
-def _is_ancestor(repo_dir: Path, env: dict, maybe_ancestor: str, ref: str) -> bool:
-    result = subprocess.run(
-        ['git', 'merge-base', '--is-ancestor', maybe_ancestor, ref],
-        cwd=repo_dir, env=env, capture_output=True
-    )
-    return result.returncode == 0
-
-
-def _is_target_branch_merge_commit(repo_dir: Path, env: dict, commit: str, base_ref: str) -> bool:
-    parents = _commit_parents(repo_dir, env, commit)
-    if len(parents) <= 1:
-        return False
-    return any(_is_ancestor(repo_dir, env, parent, base_ref) for parent in parents[1:])
-
-
-def _cherry_pick_args_for_commit(repo_dir: Path, env: dict, commit: str) -> list[str]:
-    args = ['cherry-pick', '--keep-redundant-commits']
-    if len(_commit_parents(repo_dir, env, commit)) > 1:
-        # PR branches usually record their own history as the first parent.
-        # Using mainline 1 preserves that lineage when replaying merge commits.
-        args.extend(['-m', '1'])
-    args.append(commit)
-    return args
-
-
-def _continue_in_progress_cherry_pick(
-    repo_dir: Path,
-    env: dict,
-    state: dict,
-    quiet: bool = False,
-) -> None:
-    cherry_pick_head = _cherry_pick_head_path(repo_dir, env)
-    if not cherry_pick_head.exists():
-        return
-    current_commit = cherry_pick_head.read_text().strip()
-    base_branch = state.get('base_branch') or 'main'
-    if _is_target_branch_merge_commit(repo_dir, env, current_commit, base_branch):
-        subprocess.run(
-            ['git', 'cherry-pick', '--abort'],
-            cwd=repo_dir, env=env, check=True,
-            capture_output=quiet
-        )
-        state['next_index'] = int(state.get('next_index', 0)) + 1
-        _save_cherry_pick_state(repo_dir, env, state)
-        return
-    try:
-        subprocess.run(
-            ['git', 'cherry-pick', '--continue'],
-            cwd=repo_dir, env=env, check=True,
-            capture_output=quiet, timeout=300
-        )
-    except subprocess.CalledProcessError as e:
-        raise RuntimeError(
-            "Git cherry-pick is still unresolved. Resolve conflicts in "
-            f"{repo_dir}, stage the files, then run fetch_pr.py again. "
-            f"(exit {e.returncode}): {e.stderr.decode() if e.stderr else 'unknown error'}"
-        )
-    except subprocess.TimeoutExpired:
-        raise RuntimeError(
-            f"Git cherry-pick --continue timed out. Repository is preserved at {repo_dir}; "
-            "inspect it manually, then run fetch_pr.py again."
-        )
-
-    state['next_index'] = int(state.get('next_index', 0)) + 1
-    _save_cherry_pick_state(repo_dir, env, state)
-
-
-def _cherry_pick_commits_with_resume(
-    repo_dir: Path,
-    env: dict,
-    base_branch: str,
-    source_ref: str,
-    review_branch: str,
-    commits: list[str],
-    quiet: bool = False,
-) -> None:
-    state = _load_cherry_pick_state(repo_dir, env, review_branch)
-    if state:
-        current_branch = _git_stdout(repo_dir, env, ['rev-parse', '--abbrev-ref', 'HEAD'])
-        if current_branch != review_branch:
-            subprocess.run(
-                ['git', 'checkout', review_branch],
-                cwd=repo_dir, env=env, check=True,
-                capture_output=quiet
-            )
-        _continue_in_progress_cherry_pick(repo_dir, env, state, quiet=quiet)
-        commits = state.get('commits', commits)
-    else:
-        state = {
-            'base_branch': base_branch,
-            'source_ref': source_ref,
-            'review_branch': review_branch,
-            'commits': commits,
-            'next_index': 0,
-        }
-        _save_cherry_pick_state(repo_dir, env, state)
-
-    next_index = int(state.get('next_index', 0))
-    for index in range(next_index, len(commits)):
-        commit = commits[index]
-        state['next_index'] = index
-        _save_cherry_pick_state(repo_dir, env, state)
-        if _is_target_branch_merge_commit(repo_dir, env, commit, base_branch):
-            state['next_index'] = index + 1
-            _save_cherry_pick_state(repo_dir, env, state)
-            continue
-        try:
-            subprocess.run(
-                ['git', *_cherry_pick_args_for_commit(repo_dir, env, commit)],
-                cwd=repo_dir, env=env, check=True,
-                capture_output=quiet, timeout=300
-            )
-        except subprocess.CalledProcessError as e:
-            raise RuntimeError(
-                f"Git cherry-pick commit {commit} onto target branch '{base_branch}' failed. "
-                f"Repository is preserved at {repo_dir}. Resolve conflicts, stage the files, "
-                f"then run fetch_pr.py again to continue. "
-                f"(exit {e.returncode}): {e.stderr.decode() if e.stderr else 'unknown error'}"
-            )
-        except subprocess.TimeoutExpired:
-            raise RuntimeError(
-                f"Git cherry-pick commit {commit} timed out after 300 seconds. "
-                f"Repository is preserved at {repo_dir}; inspect it manually, then run fetch_pr.py again."
-            )
-
-        state['next_index'] = index + 1
-        _save_cherry_pick_state(repo_dir, env, state)
-
-    _clear_cherry_pick_state(repo_dir, env)
-
-
 def _fetch_target_branch(repo_dir: Path, env: dict, base_branch: str, quiet: bool = False) -> None:
     subprocess.run(
         [
@@ -403,23 +226,24 @@ def _fetch_target_branch(repo_dir: Path, env: dict, base_branch: str, quiet: boo
     )
 
 
-def _prepare_cherry_pick_branch(
+def _prepare_merge_review_branch(
     repo_dir: Path,
     env: dict,
     pr: PRInfo,
     source_ref: str,
     review_branch: str,
     quiet: bool = False,
-) -> tuple[str, str]:
+) -> tuple[str, str, str]:
     """
-    Recreate the PR change on top of the PR target branch.
+    Prepare a review branch from the PR head.
 
-    Returns: (base_ref, head_ref), where both refs are local branches and can be
-    used directly by git diff.
+    Replaying each commit with cherry-pick is fragile when the PR branch has
+    merge commits that already resolved conflicts, so use a single merge of the
+    PR head into the target branch. If that final merge still conflicts, keep the
+    workspace usable by reviewing the PR head against its merge-base with the
+    target branch.
     """
-    base_branch = (pr.base_branch or 'main').strip()
-    if not base_branch:
-        base_branch = 'main'
+    base_branch = (pr.base_branch or 'main').strip() or 'main'
 
     try:
         _fetch_target_branch(repo_dir, env, base_branch, quiet=quiet)
@@ -432,44 +256,52 @@ def _prepare_cherry_pick_branch(
         raise RuntimeError(f"Git fetch target branch '{base_branch}' timed out after 120 seconds")
 
     base_remote_ref = _target_remote_ref(base_branch)
-    existing_state = _load_cherry_pick_state(repo_dir, env, review_branch)
+    try:
+        subprocess.run(
+            ['git', 'checkout', '-B', base_branch, _target_tracking_ref(base_branch)],
+            cwd=repo_dir, env=env, check=True,
+            capture_output=quiet
+        )
+        subprocess.run(
+            ['git', 'checkout', '-B', review_branch, base_branch],
+            cwd=repo_dir, env=env, check=True,
+            capture_output=quiet
+        )
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"Git checkout target/review branch failed (exit {e.returncode}): {e.stderr.decode() if e.stderr else 'unknown error'}")
 
-    if not existing_state:
-        try:
-            subprocess.run(
-                ['git', 'checkout', '-B', base_branch, _target_tracking_ref(base_branch)],
-                cwd=repo_dir, env=env, check=True,
-                capture_output=quiet
-            )
-            subprocess.run(
-                ['git', 'checkout', '-B', review_branch, base_branch],
-                cwd=repo_dir, env=env, check=True,
-                capture_output=quiet
-            )
-        except subprocess.CalledProcessError as e:
-            raise RuntimeError(f"Git checkout target/review branch failed (exit {e.returncode}): {e.stderr.decode() if e.stderr else 'unknown error'}")
-
-    rev_list = subprocess.run(
-        ['git', 'rev-list', '--reverse', f'{base_remote_ref}..{source_ref}'],
-        cwd=repo_dir, env=env, capture_output=True, text=True
+    _ensure_git_identity(repo_dir, env)
+    merge_result = subprocess.run(
+        ['git', 'merge', '--no-ff', '--no-edit', source_ref],
+        cwd=repo_dir, env=env,
+        capture_output=quiet, timeout=300
     )
-    if rev_list.returncode != 0:
-        raise RuntimeError(f"Git rev-list PR commits failed: {rev_list.stderr.strip()}")
+    if merge_result.returncode == 0:
+        return base_branch, review_branch, 'merged'
 
-    commits = [line.strip() for line in rev_list.stdout.splitlines() if line.strip()]
-    if commits:
-        _ensure_git_identity(repo_dir, env)
-        _cherry_pick_commits_with_resume(
-            repo_dir,
-            env,
-            base_branch,
-            source_ref,
-            review_branch,
-            commits,
-            quiet=quiet,
+    subprocess.run(
+        ['git', 'merge', '--abort'],
+        cwd=repo_dir, env=env,
+        capture_output=quiet
+    )
+
+    try:
+        merge_base = _git_stdout(repo_dir, env, ['merge-base', base_remote_ref, source_ref])
+        subprocess.run(
+            ['git', 'checkout', '-B', review_branch, source_ref],
+            cwd=repo_dir, env=env, check=True,
+            capture_output=quiet
+        )
+    except subprocess.CalledProcessError as e:
+        stderr = e.stderr if isinstance(getattr(e, 'stderr', None), str) else (
+            e.stderr.decode() if getattr(e, 'stderr', None) else 'unknown error'
+        )
+        raise RuntimeError(
+            f"PR merge failed and fallback setup also failed "
+            f"(exit {e.returncode}): {stderr}"
         )
 
-    return base_branch, review_branch
+    return merge_base, review_branch, 'conflict_fallback'
 
 
 # =============================================================================
@@ -577,9 +409,14 @@ def create_git_credential_helper(platform: str, token: str) -> str:
     return cred_helper.name
 
 
-def clone_pr_repo(pr: PRInfo, target_dir: Path, quiet: bool = False) -> Tuple[Path, str, str]:
+def clone_pr_repo(
+    pr: PRInfo,
+    target_dir: Path,
+    quiet: bool = False,
+    include_merge_status: bool = False,
+) -> Union[Tuple[Path, str, str], Tuple[Path, str, str, str]]:
     """
-    Clone repository and checkout a branch with PR commits cherry-picked onto the PR target branch.
+    Clone repository and checkout a review branch with the PR head merged into the target branch.
 
     Returns: (repo_path, base_ref, head_ref)
     Raises: RuntimeError on clone/fetch failures
@@ -627,7 +464,7 @@ def clone_pr_repo(pr: PRInfo, target_dir: Path, quiet: bool = False) -> Tuple[Pa
         try:
             pr_ref, local_branch = _git_ref_for_platform(pr)
             subprocess.run(
-                ['git', 'fetch', 'origin', f"+{pr_ref}:{local_branch}"],
+                ['git', 'fetch', 'origin', f"+{pr_ref}:refs/heads/{local_branch}"],
                 cwd=repo_dir, env=env, check=True,
                 capture_output=quiet, timeout=120
             )
@@ -636,7 +473,7 @@ def clone_pr_repo(pr: PRInfo, target_dir: Path, quiet: bool = False) -> Tuple[Pa
         except subprocess.TimeoutExpired:
             raise RuntimeError("Git fetch timed out after 120 seconds")
 
-        # Ensure we have enough history for target-branch commit selection.
+        # Ensure we have enough history for merge-base fallback in shallow clones.
         try:
             subprocess.run(
                 ['git', 'fetch', '--deepen=200', 'origin', pr.base_branch],
@@ -647,8 +484,8 @@ def clone_pr_repo(pr: PRInfo, target_dir: Path, quiet: bool = False) -> Tuple[Pa
             # Non-fatal, continue with what we have
             pass
 
-        review_branch = f"{local_branch}-cherry-pick"
-        base_ref, head_ref = _prepare_cherry_pick_branch(
+        review_branch = f"{local_branch}-review"
+        base_ref, head_ref, merge_status = _prepare_merge_review_branch(
             repo_dir,
             env,
             pr,
@@ -662,7 +499,10 @@ def clone_pr_repo(pr: PRInfo, target_dir: Path, quiet: bool = False) -> Tuple[Pa
             print(f"Target branch: {pr.base_branch}", file=sys.stderr)
             print(f"Base ref: {base_ref}", file=sys.stderr)
             print(f"Head ref: {head_ref}", file=sys.stderr)
+            print(f"Merge status: {merge_status}", file=sys.stderr)
 
+        if include_merge_status:
+            return repo_dir, base_ref, head_ref, merge_status
         return repo_dir, base_ref, head_ref
 
     finally:
@@ -689,15 +529,6 @@ def get_diff_stats(repo_dir: Path, base_ref: str, head_ref: str) -> str:
     """Get diff statistics."""
     result = subprocess.run(
         ['git', 'diff', '--stat', base_ref, head_ref],
-        cwd=repo_dir, capture_output=True, text=True
-    )
-    return result.stdout if result.returncode == 0 else ""
-
-
-def get_file_diff(repo_dir: Path, base_ref: str, head_ref: str, file_path: str) -> str:
-    """Get diff for a specific file."""
-    result = subprocess.run(
-        ['git', 'diff', base_ref, head_ref, '--', file_path],
         cwd=repo_dir, capture_output=True, text=True
     )
     return result.stdout if result.returncode == 0 else ""
@@ -795,7 +626,6 @@ def fetch_gitee_diff(pr: PRInfo, token: Optional[str]) -> str:
 def fetch_gitcode_diff_via_git(pr: PRInfo) -> str:
     """Fetch GitCode diff using git."""
     repo_url = pr.clone_url or f"https://gitcode.com/{pr.owner}/{pr.repo}.git"
-    mr_ref = f"refs/merge-requests/{pr.pr_id}/head"
     env = get_clean_env()
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -804,30 +634,31 @@ def fetch_gitcode_diff_via_git(pr: PRInfo) -> str:
         subprocess.run(['git', 'remote', 'add', 'origin', repo_url],
                        cwd=tmpdir, env=env, check=True, capture_output=True)
 
-        # Fetch the MR head first. The target branch comes from PR metadata.
+        # Fetch the GitCode PR head first. The target branch comes from PR metadata.
+        pr_ref, local_branch = _git_ref_for_platform(pr)
         subprocess.run(
             ['git', 'fetch', '--quiet', 'origin',
-             f'{mr_ref}:refs/remotes/origin/mr-head'],
+             f'+{pr_ref}:refs/heads/{local_branch}'],
             cwd=tmpdir, env=env, check=True,
             capture_output=True, text=True, timeout=300
         )
 
-        # Deepen if needed for rev-list against the target branch.
+        # Deepen if needed for merge-base fallback against the target branch.
         subprocess.run(
             ['git', 'fetch', '--quiet', '--deepen=500', 'origin'],
             cwd=tmpdir, env=env, capture_output=True, timeout=300
         )
 
-        base_ref, head_ref = _prepare_cherry_pick_branch(
+        base_ref, head_ref, _merge_status = _prepare_merge_review_branch(
             Path(tmpdir),
             env,
             pr,
-            'refs/remotes/origin/mr-head',
-            f"mr-{pr.pr_id}-cherry-pick",
+            local_branch,
+            f"{local_branch}-review",
             quiet=True,
         )
 
-        # Generate diff between the PR target branch and the cherry-picked branch.
+        # Generate diff between the PR target branch and the review branch.
         diff_result = subprocess.run(
             ['git', 'diff', base_ref, head_ref],
             cwd=tmpdir, env=env, capture_output=True, text=True, timeout=120
@@ -925,7 +756,9 @@ Set tokens for private repos: GITHUB_TOKEN, GITLAB_TOKEN, GITEE_TOKEN, GITCODE_T
         output_dir.mkdir(parents=True, exist_ok=True)
 
         try:
-            repo_dir, base_ref, head_ref = clone_pr_repo(pr, output_dir, args.quiet)
+            repo_dir, base_ref, head_ref, merge_status = clone_pr_repo(
+                pr, output_dir, args.quiet, include_merge_status=True
+            )
 
             # Get changed files and stats
             changed_files = get_changed_files(repo_dir, base_ref, head_ref)
@@ -937,6 +770,7 @@ Set tokens for private repos: GITHUB_TOKEN, GITLAB_TOKEN, GITEE_TOKEN, GITCODE_T
                 'repo_dir': str(repo_dir),
                 'base_ref': base_ref,
                 'head_ref': head_ref,
+                'merge_status': merge_status,
                 'changed_files': changed_files,
                 'changed_files_count': len(changed_files),
             }
