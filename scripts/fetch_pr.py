@@ -17,7 +17,6 @@ import argparse
 import json
 import os
 import re
-import shutil
 import socket
 import subprocess
 import sys
@@ -205,6 +204,194 @@ def _ensure_git_identity(repo_dir: Path, env: dict) -> None:
             )
 
 
+def _git_stdout(repo_dir: Path, env: dict, args: list[str]) -> str:
+    result = subprocess.run(
+        ['git', *args],
+        cwd=repo_dir, env=env, check=True,
+        capture_output=True, text=True
+    )
+    return result.stdout.strip()
+
+
+def _git_path(repo_dir: Path, env: dict, path: str) -> Path:
+    git_path = _git_stdout(repo_dir, env, ['rev-parse', '--git-path', path])
+    result = Path(git_path)
+    if not result.is_absolute():
+        result = repo_dir / result
+    return result
+
+
+def _cherry_pick_state_path(repo_dir: Path, env: dict) -> Path:
+    return _git_path(repo_dir, env, 'code-guarder-fetch-pr-state.json')
+
+
+def _cherry_pick_head_path(repo_dir: Path, env: dict) -> Path:
+    return _git_path(repo_dir, env, 'CHERRY_PICK_HEAD')
+
+
+def _load_cherry_pick_state(repo_dir: Path, env: dict, review_branch: str) -> Optional[dict]:
+    state_path = _cherry_pick_state_path(repo_dir, env)
+    if not state_path.exists():
+        return None
+    try:
+        state = json.loads(state_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    if state.get('review_branch') != review_branch:
+        return None
+    return state
+
+
+def _save_cherry_pick_state(repo_dir: Path, env: dict, state: dict) -> None:
+    state_path = _cherry_pick_state_path(repo_dir, env)
+    state_path.write_text(json.dumps(state, indent=2))
+
+
+def _clear_cherry_pick_state(repo_dir: Path, env: dict) -> None:
+    state_path = _cherry_pick_state_path(repo_dir, env)
+    try:
+        state_path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _commit_parents(repo_dir: Path, env: dict, commit: str) -> list[str]:
+    line = _git_stdout(repo_dir, env, ['rev-list', '--parents', '-n', '1', commit])
+    parts = line.split()
+    return parts[1:]
+
+
+def _is_ancestor(repo_dir: Path, env: dict, maybe_ancestor: str, ref: str) -> bool:
+    result = subprocess.run(
+        ['git', 'merge-base', '--is-ancestor', maybe_ancestor, ref],
+        cwd=repo_dir, env=env, capture_output=True
+    )
+    return result.returncode == 0
+
+
+def _is_target_branch_merge_commit(repo_dir: Path, env: dict, commit: str, base_ref: str) -> bool:
+    parents = _commit_parents(repo_dir, env, commit)
+    if len(parents) <= 1:
+        return False
+    return any(_is_ancestor(repo_dir, env, parent, base_ref) for parent in parents[1:])
+
+
+def _cherry_pick_args_for_commit(repo_dir: Path, env: dict, commit: str) -> list[str]:
+    args = ['cherry-pick', '--keep-redundant-commits']
+    if len(_commit_parents(repo_dir, env, commit)) > 1:
+        # PR branches usually record their own history as the first parent.
+        # Using mainline 1 preserves that lineage when replaying merge commits.
+        args.extend(['-m', '1'])
+    args.append(commit)
+    return args
+
+
+def _continue_in_progress_cherry_pick(
+    repo_dir: Path,
+    env: dict,
+    state: dict,
+    quiet: bool = False,
+) -> None:
+    cherry_pick_head = _cherry_pick_head_path(repo_dir, env)
+    if not cherry_pick_head.exists():
+        return
+    current_commit = cherry_pick_head.read_text().strip()
+    base_branch = state.get('base_branch') or 'main'
+    if _is_target_branch_merge_commit(repo_dir, env, current_commit, base_branch):
+        subprocess.run(
+            ['git', 'cherry-pick', '--abort'],
+            cwd=repo_dir, env=env, check=True,
+            capture_output=quiet
+        )
+        state['next_index'] = int(state.get('next_index', 0)) + 1
+        _save_cherry_pick_state(repo_dir, env, state)
+        return
+    try:
+        subprocess.run(
+            ['git', 'cherry-pick', '--continue'],
+            cwd=repo_dir, env=env, check=True,
+            capture_output=quiet, timeout=300
+        )
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(
+            "Git cherry-pick is still unresolved. Resolve conflicts in "
+            f"{repo_dir}, stage the files, then run fetch_pr.py again. "
+            f"(exit {e.returncode}): {e.stderr.decode() if e.stderr else 'unknown error'}"
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(
+            f"Git cherry-pick --continue timed out. Repository is preserved at {repo_dir}; "
+            "inspect it manually, then run fetch_pr.py again."
+        )
+
+    state['next_index'] = int(state.get('next_index', 0)) + 1
+    _save_cherry_pick_state(repo_dir, env, state)
+
+
+def _cherry_pick_commits_with_resume(
+    repo_dir: Path,
+    env: dict,
+    base_branch: str,
+    source_ref: str,
+    review_branch: str,
+    commits: list[str],
+    quiet: bool = False,
+) -> None:
+    state = _load_cherry_pick_state(repo_dir, env, review_branch)
+    if state:
+        current_branch = _git_stdout(repo_dir, env, ['rev-parse', '--abbrev-ref', 'HEAD'])
+        if current_branch != review_branch:
+            subprocess.run(
+                ['git', 'checkout', review_branch],
+                cwd=repo_dir, env=env, check=True,
+                capture_output=quiet
+            )
+        _continue_in_progress_cherry_pick(repo_dir, env, state, quiet=quiet)
+        commits = state.get('commits', commits)
+    else:
+        state = {
+            'base_branch': base_branch,
+            'source_ref': source_ref,
+            'review_branch': review_branch,
+            'commits': commits,
+            'next_index': 0,
+        }
+        _save_cherry_pick_state(repo_dir, env, state)
+
+    next_index = int(state.get('next_index', 0))
+    for index in range(next_index, len(commits)):
+        commit = commits[index]
+        state['next_index'] = index
+        _save_cherry_pick_state(repo_dir, env, state)
+        if _is_target_branch_merge_commit(repo_dir, env, commit, base_branch):
+            state['next_index'] = index + 1
+            _save_cherry_pick_state(repo_dir, env, state)
+            continue
+        try:
+            subprocess.run(
+                ['git', *_cherry_pick_args_for_commit(repo_dir, env, commit)],
+                cwd=repo_dir, env=env, check=True,
+                capture_output=quiet, timeout=300
+            )
+        except subprocess.CalledProcessError as e:
+            raise RuntimeError(
+                f"Git cherry-pick commit {commit} onto target branch '{base_branch}' failed. "
+                f"Repository is preserved at {repo_dir}. Resolve conflicts, stage the files, "
+                f"then run fetch_pr.py again to continue. "
+                f"(exit {e.returncode}): {e.stderr.decode() if e.stderr else 'unknown error'}"
+            )
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(
+                f"Git cherry-pick commit {commit} timed out after 300 seconds. "
+                f"Repository is preserved at {repo_dir}; inspect it manually, then run fetch_pr.py again."
+            )
+
+        state['next_index'] = index + 1
+        _save_cherry_pick_state(repo_dir, env, state)
+
+    _clear_cherry_pick_state(repo_dir, env)
+
+
 def _fetch_target_branch(repo_dir: Path, env: dict, base_branch: str, quiet: bool = False) -> None:
     subprocess.run(
         [
@@ -245,20 +432,22 @@ def _prepare_cherry_pick_branch(
         raise RuntimeError(f"Git fetch target branch '{base_branch}' timed out after 120 seconds")
 
     base_remote_ref = _target_remote_ref(base_branch)
+    existing_state = _load_cherry_pick_state(repo_dir, env, review_branch)
 
-    try:
-        subprocess.run(
-            ['git', 'checkout', '-B', base_branch, _target_tracking_ref(base_branch)],
-            cwd=repo_dir, env=env, check=True,
-            capture_output=quiet
-        )
-        subprocess.run(
-            ['git', 'checkout', '-B', review_branch, base_branch],
-            cwd=repo_dir, env=env, check=True,
-            capture_output=quiet
-        )
-    except subprocess.CalledProcessError as e:
-        raise RuntimeError(f"Git checkout target/review branch failed (exit {e.returncode}): {e.stderr.decode() if e.stderr else 'unknown error'}")
+    if not existing_state:
+        try:
+            subprocess.run(
+                ['git', 'checkout', '-B', base_branch, _target_tracking_ref(base_branch)],
+                cwd=repo_dir, env=env, check=True,
+                capture_output=quiet
+            )
+            subprocess.run(
+                ['git', 'checkout', '-B', review_branch, base_branch],
+                cwd=repo_dir, env=env, check=True,
+                capture_output=quiet
+            )
+        except subprocess.CalledProcessError as e:
+            raise RuntimeError(f"Git checkout target/review branch failed (exit {e.returncode}): {e.stderr.decode() if e.stderr else 'unknown error'}")
 
     rev_list = subprocess.run(
         ['git', 'rev-list', '--reverse', f'{base_remote_ref}..{source_ref}'],
@@ -270,27 +459,15 @@ def _prepare_cherry_pick_branch(
     commits = [line.strip() for line in rev_list.stdout.splitlines() if line.strip()]
     if commits:
         _ensure_git_identity(repo_dir, env)
-        try:
-            subprocess.run(
-                ['git', 'cherry-pick', '--keep-redundant-commits', *commits],
-                cwd=repo_dir, env=env, check=True,
-                capture_output=quiet, timeout=300
-            )
-        except subprocess.CalledProcessError as e:
-            subprocess.run(
-                ['git', 'cherry-pick', '--abort'],
-                cwd=repo_dir, env=env, capture_output=True
-            )
-            raise RuntimeError(
-                f"Git cherry-pick PR commits onto target branch '{base_branch}' failed "
-                f"(exit {e.returncode}): {e.stderr.decode() if e.stderr else 'unknown error'}"
-            )
-        except subprocess.TimeoutExpired:
-            subprocess.run(
-                ['git', 'cherry-pick', '--abort'],
-                cwd=repo_dir, env=env, capture_output=True
-            )
-            raise RuntimeError("Git cherry-pick timed out after 300 seconds")
+        _cherry_pick_commits_with_resume(
+            repo_dir,
+            env,
+            base_branch,
+            source_ref,
+            review_branch,
+            commits,
+            quiet=quiet,
+        )
 
     return base_branch, review_branch
 
@@ -425,34 +602,38 @@ def clone_pr_repo(pr: PRInfo, target_dir: Path, quiet: bool = False) -> Tuple[Pa
             print(f"Warning: Could not setup git credentials: {e}", file=sys.stderr)
 
     try:
-        if not quiet:
-            print(f"Cloning {pr.owner}/{pr.repo}...", file=sys.stderr)
+        if repo_dir.exists():
+            if not (repo_dir / '.git').exists():
+                raise RuntimeError(f"Target path already exists but is not a git repository: {repo_dir}")
+            if not quiet:
+                print(f"Reusing existing repository at: {repo_dir}", file=sys.stderr)
+        else:
+            if not quiet:
+                print(f"Cloning {pr.owner}/{pr.repo}...", file=sys.stderr)
 
-        # Clone with limited depth
-        try:
-            subprocess.run(
-                ['git', 'clone', '--depth=100', clone_url, str(repo_dir)],
-                env=env, check=True,
-                capture_output=quiet, timeout=300
-            )
-        except subprocess.CalledProcessError as e:
-            raise RuntimeError(f"Git clone failed (exit {e.returncode}): {e.stderr.decode() if e.stderr else 'unknown error'}")
-        except subprocess.TimeoutExpired:
-            raise RuntimeError("Git clone timed out after 300 seconds")
+            # Clone with limited depth
+            try:
+                subprocess.run(
+                    ['git', 'clone', '--depth=100', clone_url, str(repo_dir)],
+                    env=env, check=True,
+                    capture_output=quiet, timeout=300
+                )
+            except subprocess.CalledProcessError as e:
+                raise RuntimeError(f"Git clone failed (exit {e.returncode}): {e.stderr.decode() if e.stderr else 'unknown error'}")
+            except subprocess.TimeoutExpired:
+                raise RuntimeError("Git clone timed out after 300 seconds")
 
         # Fetch PR ref based on platform
         try:
             pr_ref, local_branch = _git_ref_for_platform(pr)
             subprocess.run(
-                ['git', 'fetch', 'origin', f"{pr_ref}:{local_branch}"],
+                ['git', 'fetch', 'origin', f"+{pr_ref}:{local_branch}"],
                 cwd=repo_dir, env=env, check=True,
                 capture_output=quiet, timeout=120
             )
         except subprocess.CalledProcessError as e:
-            shutil.rmtree(repo_dir, ignore_errors=True)
             raise RuntimeError(f"Git fetch PR ref failed (exit {e.returncode}): {e.stderr.decode() if e.stderr else 'unknown error'}")
         except subprocess.TimeoutExpired:
-            shutil.rmtree(repo_dir, ignore_errors=True)
             raise RuntimeError("Git fetch timed out after 120 seconds")
 
         # Ensure we have enough history for target-branch commit selection.
@@ -467,18 +648,14 @@ def clone_pr_repo(pr: PRInfo, target_dir: Path, quiet: bool = False) -> Tuple[Pa
             pass
 
         review_branch = f"{local_branch}-cherry-pick"
-        try:
-            base_ref, head_ref = _prepare_cherry_pick_branch(
-                repo_dir,
-                env,
-                pr,
-                local_branch,
-                review_branch,
-                quiet=quiet,
-            )
-        except Exception:
-            shutil.rmtree(repo_dir, ignore_errors=True)
-            raise
+        base_ref, head_ref = _prepare_cherry_pick_branch(
+            repo_dir,
+            env,
+            pr,
+            local_branch,
+            review_branch,
+            quiet=quiet,
+        )
 
         if not quiet:
             print(f"Repository ready at: {repo_dir}", file=sys.stderr)
