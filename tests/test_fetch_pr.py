@@ -1,7 +1,9 @@
+import os
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from scripts import fetch_pr
 
@@ -173,6 +175,29 @@ def create_remote_with_resolved_conflict_merge_pr(tmpdir: Path) -> Path:
 
 
 class FetchPrTargetBranchTests(unittest.TestCase):
+    def test_git_askpass_helper_returns_prompt_specific_values(self):
+        with patch.dict(os.environ, {"GITCODE_USERNAME": "alice"}, clear=False):
+            helper_path = fetch_pr.create_git_credential_helper("gitcode", "tok'en value")
+
+        try:
+            username = subprocess.run(
+                [helper_path, "Username for 'https://gitcode.com':"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            password = subprocess.run(
+                [helper_path, "Password for 'https://alice@gitcode.com':"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        finally:
+            os.unlink(helper_path)
+
+        self.assertEqual(username.stdout, "alice\n")
+        self.assertEqual(password.stdout, "tok'en value\n")
+
     def test_clone_pr_repo_merges_onto_pr_target_branch(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmpdir_path = Path(tmpdir)
@@ -280,6 +305,42 @@ class FetchPrTargetBranchTests(unittest.TestCase):
 
             self.assertIn("diff --git a/feature.txt b/feature.txt", diff)
             self.assertNotIn("target.txt", diff)
+
+    def test_gitcode_diff_via_git_configures_token_auth_env(self):
+        pr = fetch_pr.PRInfo(
+            platform="gitcode",
+            owner="owner",
+            repo="repo",
+            pr_id="8",
+            url="https://gitcode.com/owner/repo/pull/8",
+            base_branch="main",
+            clone_url="https://gitcode.com/owner/repo.git",
+        )
+        seen_envs = []
+
+        def fake_run(args, cwd=None, env=None, **kwargs):
+            seen_envs.append(dict(env or {}))
+            if args[:2] == ["git", "diff"]:
+                return subprocess.CompletedProcess(
+                    args,
+                    0,
+                    stdout="diff --git a/file.txt b/file.txt\n",
+                    stderr="",
+                )
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+        with patch("scripts.fetch_pr.subprocess.run", side_effect=fake_run):
+            with patch(
+                "scripts.fetch_pr._prepare_merge_review_branch",
+                return_value=("origin/main", "pr_8-review", "merged"),
+            ):
+                diff = fetch_pr.fetch_gitcode_diff_via_git(pr, token="secret-token")
+
+        self.assertIn("diff --git", diff)
+        self.assertTrue(seen_envs)
+        helper_path = seen_envs[0]["GIT_ASKPASS"]
+        self.assertEqual(seen_envs[0]["GIT_TERMINAL_PROMPT"], "0")
+        self.assertFalse(Path(helper_path).exists())
 
     def test_gitcode_clone_merges_pr_head_with_resolved_conflict_merge(self):
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -17,6 +17,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import socket
 import subprocess
 import sys
@@ -390,23 +391,51 @@ def fetch_pr_metadata(pr: PRInfo) -> PRInfo:
 # Clone Mode - Clone repo and checkout target-based review branch
 # =============================================================================
 
+def _git_username_for_platform(platform: str) -> str:
+    env_name = f"{platform.upper()}_USERNAME"
+    configured = os.environ.get(env_name, "").strip()
+    if configured:
+        return configured
+    return {
+        'github': 'x-access-token',
+        'gitlab': 'oauth2',
+        'gitee': 'oauth2',
+        'gitcode': 'oauth2',
+    }.get(platform, 'oauth2')
+
+
 def create_git_credential_helper(platform: str, token: str) -> str:
     """
-    Create a temporary git credential helper script.
+    Create a temporary GIT_ASKPASS helper script.
+
+    GIT_ASKPASS is called once per prompt and must return only the requested
+    value. It is not the same protocol as git credential helpers.
     Returns the path to the script.
     """
     import tempfile
     cred_helper = tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.sh', prefix='git-cred-')
+    username = _git_username_for_platform(platform)
 
     cred_helper.write('#!/bin/sh\n')
-    if platform == 'gitlab':
-        cred_helper.write(f'echo "username=oauth2"\necho "password={token}"\n')
-    else:
-        cred_helper.write(f'echo "username={token}"\necho "password="\n')
+    cred_helper.write('case "$1" in\n')
+    cred_helper.write(f"  *Username*|*username*) printf '%s\\n' {shlex.quote(username)} ;;\n")
+    cred_helper.write(f"  *Password*|*password*) printf '%s\\n' {shlex.quote(token)} ;;\n")
+    cred_helper.write(f"  *) printf '%s\\n' {shlex.quote(token)} ;;\n")
+    cred_helper.write('esac\n')
     cred_helper.close()
     os.chmod(cred_helper.name, 0o700)
 
     return cred_helper.name
+
+
+def configure_git_auth_env(env: dict, platform: str, token: Optional[str]) -> Optional[str]:
+    """Configure non-interactive git HTTPS authentication and return helper path."""
+    env['GIT_TERMINAL_PROMPT'] = '0'
+    if not token:
+        return None
+    cred_helper_path = create_git_credential_helper(platform, token)
+    env['GIT_ASKPASS'] = cred_helper_path
+    return cred_helper_path
 
 
 def clone_pr_repo(
@@ -428,15 +457,12 @@ def clone_pr_repo(
     clone_url = pr.clone_url
     repo_dir = target_dir / pr.repo
 
-    # Setup credential helper for private repos
+    # Setup askpass helper for private repos and disable interactive prompts.
     cred_helper_path = None
-    if token:
-        try:
-            cred_helper_path = create_git_credential_helper(pr.platform, token)
-            env['GIT_ASKPASS'] = cred_helper_path
-            env['GIT_TERMINAL_PROMPT'] = '0'
-        except Exception as e:
-            print(f"Warning: Could not setup git credentials: {e}", file=sys.stderr)
+    try:
+        cred_helper_path = configure_git_auth_env(env, pr.platform, token)
+    except Exception as e:
+        print(f"Warning: Could not setup git credentials: {e}", file=sys.stderr)
 
     try:
         if repo_dir.exists():
@@ -623,61 +649,72 @@ def fetch_gitee_diff(pr: PRInfo, token: Optional[str]) -> str:
         raise
 
 
-def fetch_gitcode_diff_via_git(pr: PRInfo) -> str:
+def fetch_gitcode_diff_via_git(pr: PRInfo, token: Optional[str] = None) -> str:
     """Fetch GitCode diff using git."""
     repo_url = pr.clone_url or f"https://gitcode.com/{pr.owner}/{pr.repo}.git"
     env = get_clean_env()
+    if token is None:
+        token = get_token(pr.platform)
+    cred_helper_path = None
+    try:
+        cred_helper_path = configure_git_auth_env(env, pr.platform, token)
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        subprocess.run(['git', 'init', '--quiet'], cwd=tmpdir, env=env, check=True,
-                       capture_output=True)
-        subprocess.run(['git', 'remote', 'add', 'origin', repo_url],
-                       cwd=tmpdir, env=env, check=True, capture_output=True)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            subprocess.run(['git', 'init', '--quiet'], cwd=tmpdir, env=env, check=True,
+                           capture_output=True)
+            subprocess.run(['git', 'remote', 'add', 'origin', repo_url],
+                           cwd=tmpdir, env=env, check=True, capture_output=True)
 
-        # Fetch the GitCode PR head first. The target branch comes from PR metadata.
-        pr_ref, local_branch = _git_ref_for_platform(pr)
-        subprocess.run(
-            ['git', 'fetch', '--quiet', 'origin',
-             f'+{pr_ref}:refs/heads/{local_branch}'],
-            cwd=tmpdir, env=env, check=True,
-            capture_output=True, text=True, timeout=300
-        )
+            # Fetch the GitCode PR head first. The target branch comes from PR metadata.
+            pr_ref, local_branch = _git_ref_for_platform(pr)
+            subprocess.run(
+                ['git', 'fetch', '--quiet', 'origin',
+                 f'+{pr_ref}:refs/heads/{local_branch}'],
+                cwd=tmpdir, env=env, check=True,
+                capture_output=True, text=True, timeout=300
+            )
 
-        # Deepen if needed for merge-base fallback against the target branch.
-        subprocess.run(
-            ['git', 'fetch', '--quiet', '--deepen=500', 'origin'],
-            cwd=tmpdir, env=env, capture_output=True, timeout=300
-        )
+            # Deepen if needed for merge-base fallback against the target branch.
+            subprocess.run(
+                ['git', 'fetch', '--quiet', '--deepen=500', 'origin'],
+                cwd=tmpdir, env=env, capture_output=True, timeout=300
+            )
 
-        base_ref, head_ref, _merge_status = _prepare_merge_review_branch(
-            Path(tmpdir),
-            env,
-            pr,
-            local_branch,
-            f"{local_branch}-review",
-            quiet=True,
-        )
+            base_ref, head_ref, _merge_status = _prepare_merge_review_branch(
+                Path(tmpdir),
+                env,
+                pr,
+                local_branch,
+                f"{local_branch}-review",
+                quiet=True,
+            )
 
-        # Generate diff between the PR target branch and the review branch.
-        diff_result = subprocess.run(
-            ['git', 'diff', base_ref, head_ref],
-            cwd=tmpdir, env=env, capture_output=True, text=True, timeout=120
-        )
+            # Generate diff between the PR target branch and the review branch.
+            diff_result = subprocess.run(
+                ['git', 'diff', base_ref, head_ref],
+                cwd=tmpdir, env=env, capture_output=True, text=True, timeout=120
+            )
 
-        if diff_result.returncode != 0:
-            raise RuntimeError(f"git diff failed: {diff_result.stderr}")
+            if diff_result.returncode != 0:
+                raise RuntimeError(f"git diff failed: {diff_result.stderr}")
 
-        diff = diff_result.stdout
-        if not diff.strip():
-            raise RuntimeError("Empty diff")
+            diff = diff_result.stdout
+            if not diff.strip():
+                raise RuntimeError("Empty diff")
 
-        return diff
+            return diff
+    finally:
+        if cred_helper_path:
+            try:
+                os.unlink(cred_helper_path)
+            except Exception:
+                pass
 
 
 def fetch_gitcode_diff(pr: PRInfo, token: Optional[str]) -> str:
     """Fetch diff from GitCode."""
     try:
-        return fetch_gitcode_diff_via_git(pr)
+        return fetch_gitcode_diff_via_git(pr, token=token)
     except Exception as e:
         raise RuntimeError(f"Could not fetch GitCode diff: {e}")
 
