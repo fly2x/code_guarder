@@ -83,11 +83,14 @@ python3 scripts/run_review.py --context ./workspace/review_context.json --gemini
 # Use Codex's internal sandbox instead of the default bypass mode
 python3 scripts/run_review.py --context ./workspace/review_context.json --codex-use-sandbox -o ./review-output
 
-# Specify consolidation model (default: codex-spark)
+# Specify a non-default consolidation provider (default: codex-spark)
 python3 scripts/run_review.py --context ./workspace/review_context.json --gemini --consolidation-model gemini -o ./review-output
 
-# Explicitly pin the default Codex Spark consolidation settings
-python3 scripts/run_review.py --context ./workspace/review_context.json --gemini --consolidation-model codex-spark --codex-reasoning-effort xhigh -o ./review-output
+# Explicitly pin the default GPT-5.3-Codex-Spark consolidation settings
+python3 scripts/run_review.py --context ./workspace/review_context.json --consolidation-model codex-spark --codex-reasoning-effort xhigh -o ./review-output
+
+# Use GPT-5.6-Sol for consolidation instead
+python3 scripts/run_review.py --context ./workspace/review_context.json --gemini --consolidation-model codex --codex-reasoning-effort xhigh -o ./review-output
 ```
 
 ### GitCode One-Click Review
@@ -125,7 +128,7 @@ Default layout for `openHiTLS/hitls4j` PR `35`:
 | `--codex-reasoning-effort` | Override Codex reasoning effort: low, medium, high, or xhigh (default: xhigh) |
 | `--init`, `-i` | Initialize AI tools before review |
 | `--no-consolidate` | Skip consolidation phase |
-| `--consolidation-model` | AI model for consolidation phase: claude, gemini, codex, codex-spark, or opencode (default: codex-spark) |
+| `--consolidation-model` | AI provider/model for consolidation phase: claude, gemini, codex, codex-spark, or opencode (default: codex-spark using `gpt-5.3-codex-spark`; codex uses `gpt-5.6-sol`) |
 | `--base-ref` | Base ref for diff (default: origin/main) |
 | `--head-ref` | Head ref for diff (default: HEAD) |
 | `--custom-rules` | Custom review rules text to inject into the review prompt |
@@ -175,10 +178,9 @@ PR URL --> fetch_pr.py --clone --> cloned repo + context.json
          +----------------+----------------+----------------+----------------+
                                          |
                                 Consolidation Phase
-                                (Codex Spark validates by default
-                                 with xhigh reasoning effort,
-                                 use --consolidation-model to change,
-                                 including codex-spark and opencode)
+                                (Codex GPT-5.6-Sol validates by default
+                                 with xhigh reasoning effort; use
+                                 --consolidation-model to change provider)
                                          |
                                 final_report.md/html/json
 ```
@@ -309,10 +311,10 @@ FIX:
 |------|---------------|----------------|
 | Claude | `claude -p --output-format text --dangerously-skip-permissions "<prompt>"` | `--dangerously-skip-permissions` |
 | Gemini | `gemini -p "<prompt>" -y` | `-y` (YOLO mode) |
-| Codex | `codex exec --dangerously-bypass-approvals-and-sandbox -` | `--dangerously-bypass-approvals-and-sandbox` |
+| Codex | `codex exec --model gpt-5.6-sol --dangerously-bypass-approvals-and-sandbox -` | `--dangerously-bypass-approvals-and-sandbox` |
 | OpenCode | `opencode run --dangerously-skip-permissions "<prompt>"` | `--dangerously-skip-permissions` |
 
-**Note**: Codex reads the prompt from stdin via `-`. Gemini, Claude, and OpenCode run headlessly by receiving the prompt as a CLI argument. Codex now bypasses its internal sandbox by default; pass `--codex-use-sandbox` to restore the older `--full-auto` mode. `run_review.py` now defaults `--codex-reasoning-effort` to `xhigh`, and consolidation defaults to `--consolidation-model codex-spark`, which maps to `gpt-5.3-codex-spark`. The review flow is constrained to the local checkout and should not need remote PR pages or web search.
+**Note**: Codex reads the prompt from stdin via `-`. Gemini, Claude, and OpenCode run headlessly by receiving the prompt as a CLI argument. Regular Codex phases use `gpt-5.6-sol` with `--codex-reasoning-effort xhigh` by default, while consolidation defaults to `gpt-5.3-codex-spark`; pass `--consolidation-model codex` to use `gpt-5.6-sol` for consolidation. Codex bypasses its internal sandbox by default; pass `--codex-use-sandbox` to restore the older `--full-auto` mode. The review flow is constrained to the local checkout and should not need remote PR pages or web search.
 
 ## Timeouts
 

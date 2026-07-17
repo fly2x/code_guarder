@@ -172,7 +172,7 @@ npm install -g @openai/codex
 |------|---------|-----------|
 | Claude | `claude -p --output-format text --dangerously-skip-permissions` | `--dangerously-skip-permissions` |
 | Gemini | `gemini -y` | `-y` |
-| Codex | `codex exec --dangerously-bypass-approvals-and-sandbox -` | `--dangerously-bypass-approvals-and-sandbox` |
+| Codex | `codex exec --model gpt-5.6-sol --dangerously-bypass-approvals-and-sandbox -` | `--dangerously-bypass-approvals-and-sandbox` |
 
 - Initialization runs in **parallel** for all enabled tools
 - Init timeout: 10 min, Review timeout: 30 min
