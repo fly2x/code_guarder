@@ -25,10 +25,13 @@ except ImportError:
     import pr_comments as pr_comments_module
 
 
+DEFAULT_CODEX_MODEL = "gpt-5.6-sol"
 CODEX_SPARK_MODEL = "gpt-5.3-codex-spark"
 CODEX_REASONING_EFFORT_CHOICES = ["low", "medium", "high", "xhigh"]
 DEFAULT_CONSOLIDATION_MODEL = "codex-spark"
 DEFAULT_CODEX_REASONING_EFFORT = "xhigh"
+CODEX_INIT_REASONING_EFFORT = "low"
+CODEX_INIT_TIMEOUT_SECONDS = 180
 
 
 @dataclass
@@ -225,12 +228,15 @@ def build_codex_command(
     repo_dir: Path,
     *,
     use_sandbox: bool = False,
-    model: Optional[str] = None,
+    model: Optional[str] = DEFAULT_CODEX_MODEL,
     reasoning_effort: Optional[str] = DEFAULT_CODEX_REASONING_EFFORT,
+    ignore_user_config: bool = False,
 ) -> list[str]:
     """Build a Codex CLI command for this repository."""
     command = ['codex', 'exec']
 
+    if ignore_user_config:
+        command.append('--ignore-user-config')
     if model:
         command.extend(['--model', model])
     if reasoning_effort:
@@ -528,8 +534,8 @@ Now analyze the current directory structure and source files, then write CLAUDE.
 def init_codex(
     repo_dir: Path,
     use_sandbox: bool = False,
-    model: Optional[str] = None,
-    reasoning_effort: Optional[str] = DEFAULT_CODEX_REASONING_EFFORT,
+    model: Optional[str] = DEFAULT_CODEX_MODEL,
+    reasoning_effort: Optional[str] = CODEX_INIT_REASONING_EFFORT,
 ) -> bool:
     """Initialize Codex context by generating AGENTS.md if not exists.
 
@@ -555,6 +561,7 @@ def init_codex(
             use_sandbox=use_sandbox,
             model=model,
             reasoning_effort=reasoning_effort,
+            ignore_user_config=True,
         )
         command[-1:-1] = ['--output-last-message', str(agents_md)]
         proc = subprocess.run(
@@ -563,7 +570,7 @@ def init_codex(
             capture_output=True,
             text=True,
             cwd=repo_dir,
-            timeout=600
+            timeout=CODEX_INIT_TIMEOUT_SECONDS,
         )
         if agents_md.exists() and agents_md.stat().st_size > 0:
             print_success("AGENTS.md generated")
@@ -575,6 +582,14 @@ def init_codex(
             if proc.stderr:
                 print_warning(f"stderr: {proc.stderr[:500]}")
             return False
+    except subprocess.TimeoutExpired:
+        if agents_md.exists() and agents_md.stat().st_size > 0:
+            print_success("AGENTS.md generated before Codex init timed out")
+            return True
+        print_warning(
+            f"Codex init timed out after {CODEX_INIT_TIMEOUT_SECONDS} seconds"
+        )
+        return False
     except Exception as e:
         print_warning(f"Codex init failed: {e}")
         return False
@@ -717,7 +732,7 @@ def init_agents_md(
     if use_codex and init_codex(
         repo_dir,
         use_sandbox=codex_use_sandbox,
-        reasoning_effort=codex_reasoning_effort,
+        reasoning_effort=CODEX_INIT_REASONING_EFFORT,
     ):
         return True
 
@@ -974,7 +989,7 @@ def run_codex_agent(
     prompt: str,
     output_file: Path,
     use_sandbox: bool = False,
-    model: Optional[str] = None,
+    model: Optional[str] = DEFAULT_CODEX_MODEL,
     reasoning_effort: Optional[str] = DEFAULT_CODEX_REASONING_EFFORT,
 ) -> tuple[Path, list[str]]:
     """Run generic Codex CLI agent with real-time output streaming."""
@@ -1001,7 +1016,7 @@ def run_codex_review_agent(
     prompt: str,
     output_file: Path,
     use_sandbox: bool = False,
-    model: Optional[str] = None,
+    model: Optional[str] = DEFAULT_CODEX_MODEL,
     reasoning_effort: Optional[str] = DEFAULT_CODEX_REASONING_EFFORT,
 ) -> tuple[Path, list[str]]:
     """Run Codex CLI for review using the project-specific stdin prompt."""
@@ -1399,11 +1414,12 @@ def run_consolidation(
     agent_map = {
         'claude': ('Claude Code', lambda repo_dir, prompt, output_file: run_claude_agent(repo_dir, prompt, output_file)),
         'gemini': ('Gemini CLI', lambda repo_dir, prompt, output_file: run_gemini_agent(repo_dir, prompt, output_file)),
-        'codex': ('Codex CLI', lambda repo_dir, prompt, output_file: run_codex_agent(
+        'codex': ('Codex CLI (GPT-5.6-Sol)', lambda repo_dir, prompt, output_file: run_codex_agent(
             repo_dir,
             prompt,
             output_file,
             use_sandbox=codex_use_sandbox,
+            model=DEFAULT_CODEX_MODEL,
             reasoning_effort=codex_reasoning_effort,
         )),
         'codex-spark': ('Codex CLI (GPT-5.3-Codex-Spark)', lambda repo_dir, prompt, output_file: run_codex_agent(
@@ -1879,7 +1895,10 @@ Examples:
   %(prog)s --context ./workspace/review_context.json --gemini --output ./review-output
 
   # Explicitly pin the default Codex Spark consolidation settings
-  %(prog)s --context ./workspace/review_context.json --gemini --consolidation-model codex-spark --codex-reasoning-effort xhigh --output ./review-output
+  %(prog)s --context ./workspace/review_context.json --consolidation-model codex-spark --codex-reasoning-effort xhigh --output ./review-output
+
+  # Use GPT-5.6-Sol for consolidation instead
+  %(prog)s --context ./workspace/review_context.json --gemini --consolidation-model codex --codex-reasoning-effort xhigh --output ./review-output
 
 AI Tool Context Files:
   - Claude Code: CLAUDE.md (project instructions, coding style)
@@ -1920,7 +1939,7 @@ AI Tool Context Files:
                         help="Head ref for diff (default: HEAD)")
     parser.add_argument("--consolidation-model", type=str, default=DEFAULT_CONSOLIDATION_MODEL,
                         choices=['claude', 'gemini', 'codex', 'codex-spark', 'opencode'],
-                        help=f"AI model for consolidation phase (default: {DEFAULT_CONSOLIDATION_MODEL})")
+                        help=f"AI provider for consolidation phase (default: {DEFAULT_CONSOLIDATION_MODEL})")
     parser.add_argument("--custom-rules", type=str, default=None,
                         help="Custom review rules text to inject into the review prompt")
     parser.add_argument("--custom-rules-file", type=Path, default=None,
