@@ -78,11 +78,12 @@ class InitOpenCodeTests(unittest.TestCase):
                             repo_dir,
                             use_codex=True,
                             use_opencode=True,
+                            opencode_model="provider/test-model",
                         )
                     )
 
         mock_codex.assert_called_once()
-        mock_opencode.assert_called_once_with(repo_dir)
+        mock_opencode.assert_called_once_with(repo_dir, model="provider/test-model")
 
 
 class CodexCommandTests(unittest.TestCase):
@@ -319,7 +320,7 @@ class ParallelReviewReportTests(unittest.TestCase):
                 output_file.write_text(issue_block)
                 return output_file, issue_block.splitlines()
 
-            with patch("scripts.run_review.run_opencode_agent", side_effect=fake_opencode):
+            with patch("scripts.run_review.run_opencode_agent", side_effect=fake_opencode) as mock_opencode:
                 review_reports, all_issues = run_review.run_parallel_reviews(
                     repo_dir=repo_dir,
                     context=context,
@@ -328,10 +329,12 @@ class ParallelReviewReportTests(unittest.TestCase):
                     use_gemini=False,
                     use_codex=False,
                     use_opencode=True,
+                    opencode_model="provider/test-model",
                 )
 
             self.assertEqual(review_reports["opencode"], output_dir / "opencode_review.md")
             self.assertEqual(len(all_issues["opencode"]), 1)
+            self.assertEqual(mock_opencode.call_args.kwargs["model"], "provider/test-model")
             self.assertEqual(all_issues["opencode"][0]["title"], "Example issue")
 
 
@@ -379,12 +382,58 @@ class ConsolidationTests(unittest.TestCase):
                     context={"owner": "owner", "repo": "repo", "pr_id": "123"},
                     output_dir=output_dir,
                     consolidation_model="opencode",
+                    opencode_model="provider/test-model",
                 )
 
         mock_opencode.assert_called_once()
+        self.assertEqual(mock_opencode.call_args.kwargs["model"], "provider/test-model")
 
 
 class MainDefaultsTests(unittest.TestCase):
+    def test_single_reviewer_is_revalidated_unless_disabled(self):
+        for skip in (False, True):
+            with self.subTest(skip=skip), tempfile.TemporaryDirectory() as tmpdir:
+                root = Path(tmpdir)
+                context_path = root / "context.json"
+                context_path.write_text(json.dumps({"repo_dir": str(root)}))
+                output_dir = root / "out"
+                original = {"file": "a.c", "line": "1", "title": "Original", "source": "opencode"}
+                argv = ["run_review.py", "--context", str(context_path),
+                        "--no-codex", "--opencode", "--consolidation-model", "opencode",
+                        "--opencode-model", "provider/test-model", "--init",
+                        "--output", str(output_dir)]
+                if skip:
+                    argv.append("--no-consolidate")
+
+                def consolidate(*args, **kwargs):
+                    result = output_dir / "consolidation_output.txt"
+                    result.write_text("===ISSUE===\nFILE: a.c\nLINE: 1\nTITLE: Verified\n"
+                                      "SEVERITY: high\nREVIEWERS: opencode\nCONFIDENCE: likely\n"
+                                      "PROBLEM: Verified problem\nCODE:\n```c\nbad();\n```\n"
+                                      "FIX:\n```c\ngood();\n```\n===END===\n")
+                    return result
+
+                with patch.object(run_review.sys, "argv", argv), patch(
+                    "scripts.run_review.run_parallel_reviews",
+                    return_value=({"opencode": root / "opencode_review.md"}, {"opencode": [original]}),
+                ) as initial, patch("scripts.run_review.run_consolidation", side_effect=consolidate) as review, patch(
+                    "scripts.run_review.init_opencode", return_value=True,
+                ) as init:
+                    run_review.main()
+                self.assertEqual(initial.call_args.kwargs["opencode_model"], "provider/test-model")
+                init.assert_called_once_with(root, model="provider/test-model")
+                issue = json.loads((output_dir / "final_report.json").read_text())["issues"][0]
+                if skip:
+                    review.assert_not_called()
+                    self.assertEqual(issue["title"], "Original")
+                else:
+                    review.assert_called_once()
+                    self.assertEqual(review.call_args.args[4], "opencode")
+                    self.assertEqual(review.call_args.kwargs["opencode_model"], "provider/test-model")
+                    self.assertEqual(issue["title"], "Verified")
+                    self.assertEqual(issue["confidence"], "likely")
+                    self.assertEqual(issue["fix"], "good();")
+
     def test_main_defaults_to_codex_spark_consolidation_and_xhigh_effort(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmpdir_path = Path(tmpdir)
@@ -490,6 +539,7 @@ class MainDefaultsTests(unittest.TestCase):
                     str(context_path),
                     "--no-codex",
                     "--opencode",
+                    "--no-consolidate",
                     "--output",
                     str(output_dir),
                 ],

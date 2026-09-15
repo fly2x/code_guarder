@@ -707,6 +707,7 @@ def init_agents_md(
     use_opencode: bool,
     codex_use_sandbox: bool = False,
     codex_reasoning_effort: Optional[str] = DEFAULT_CODEX_REASONING_EFFORT,
+    opencode_model: Optional[str] = None,
 ) -> bool:
     """Initialize the shared AGENTS.md file for tools that consume it."""
     agents_md = repo_dir / "AGENTS.md"
@@ -721,7 +722,7 @@ def init_agents_md(
     ):
         return True
 
-    if use_opencode and init_opencode(repo_dir):
+    if use_opencode and init_opencode(repo_dir, model=opencode_model):
         return True
 
     return False
@@ -735,6 +736,7 @@ def init_ai_tools(
     use_opencode: bool,
     codex_use_sandbox: bool = False,
     codex_reasoning_effort: Optional[str] = DEFAULT_CODEX_REASONING_EFFORT,
+    opencode_model: Optional[str] = None,
 ) -> None:
     """Initialize all enabled AI tools in parallel."""
     print_header("Initializing AI Tools")
@@ -751,6 +753,7 @@ def init_ai_tools(
                 repo_dir,
                 use_codex=use_codex,
                 use_opencode=use_opencode,
+                opencode_model=opencode_model,
                 codex_use_sandbox=codex_use_sandbox,
                 codex_reasoning_effort=codex_reasoning_effort,
             ),
@@ -1263,7 +1266,7 @@ def generate_html_report(issues: list[dict], context: dict, reviewer: str = '') 
 # =============================================================================
 
 def generate_consolidation_prompt(review_reports: dict[str, Path], context: dict) -> str:
-    """Generate prompt for Codex to consolidate multiple reviews."""
+    """Generate a prompt to validate and consolidate review reports."""
 
     reports_content = []
     for reviewer, report_path in review_reports.items():
@@ -1287,7 +1290,8 @@ Issues that violate these rules should be given higher priority:
 
     prompt = f"""# Change Review Consolidation Task
 
-You are consolidating change review findings from multiple AI reviewers.
+You are validating and consolidating change review findings from one or more AI reviewers.
+For a single report, independently recheck every finding against the repository.
 
 ## Context
 - Repository: {context.get('owner', '')}/{context.get('repo', '')}
@@ -1310,6 +1314,7 @@ You are consolidating change review findings from multiple AI reviewers.
    - Use `git diff` and file reads to confirm
    - Remove false positives
    - Adjust severity if needed
+   - Verify the proposed fix; supply a concrete fix if it is missing or incorrect
 
 3. **Consolidate Findings**
    - Merge duplicate issues (note which reviewers found it)
@@ -1373,6 +1378,7 @@ def run_consolidation(
     consolidation_model: str = DEFAULT_CONSOLIDATION_MODEL,
     codex_use_sandbox: bool = False,
     codex_reasoning_effort: Optional[str] = DEFAULT_CODEX_REASONING_EFFORT,
+    opencode_model: Optional[str] = None,
 ) -> Path:
     """Run AI CLI to consolidate all review reports.
 
@@ -1418,6 +1424,7 @@ def run_consolidation(
             repo_dir,
             prompt,
             output_file,
+            model=opencode_model,
         )),
     }
 
@@ -1778,6 +1785,7 @@ def run_parallel_reviews(
     use_opencode: bool = False,
     codex_use_sandbox: bool = False,
     codex_reasoning_effort: Optional[str] = DEFAULT_CODEX_REASONING_EFFORT,
+    opencode_model: Optional[str] = None,
 ) -> dict[str, Path]:
     """Run multiple AI reviews in parallel."""
 
@@ -1819,7 +1827,7 @@ def run_parallel_reviews(
                 reasoning_effort=codex_reasoning_effort,
             )
         elif reviewer == 'opencode':
-            result_file, _ = run_opencode_agent(repo_dir, prompt, output_file)
+            result_file, _ = run_opencode_agent(repo_dir, prompt, output_file, model=opencode_model)
         else:
             return reviewer, None, []
 
@@ -1900,6 +1908,8 @@ AI Tool Context Files:
                         help="Also run Claude Code review in parallel")
     parser.add_argument("--opencode", action="store_true",
                         help="Also run OpenCode CLI review in parallel")
+    parser.add_argument("--opencode-model", type=str, default=None, metavar="PROVIDER/MODEL",
+                        help="OpenCode model for review, initialization and OpenCode consolidation (default: CLI configuration)")
     parser.add_argument("--codex", "-x", action="store_true",
                         help="Explicitly enable Codex CLI review (default on)")
     parser.add_argument("--no-codex", action="store_true",
@@ -2037,6 +2047,7 @@ AI Tool Context Files:
             use_gemini,
             use_codex,
             use_opencode,
+            opencode_model=args.opencode_model,
             codex_use_sandbox=args.codex_use_sandbox,
             codex_reasoning_effort=args.codex_reasoning_effort,
         )
@@ -2050,6 +2061,7 @@ AI Tool Context Files:
         use_gemini=use_gemini,
         use_codex=use_codex,
         use_opencode=use_opencode,
+        opencode_model=args.opencode_model,
         codex_use_sandbox=args.codex_use_sandbox,
         codex_reasoning_effort=args.codex_reasoning_effort,
     )
@@ -2060,11 +2072,11 @@ AI Tool Context Files:
                            (r == 'codex' and use_codex) or
                            (r == 'opencode' and use_opencode)]
 
-    # Phase 2: Consolidation (if multiple reviewers or explicitly requested)
+    # Phase 2: Validate and consolidate available reports unless disabled.
     total_issues = sum(len(issues) for issues in all_issues.values())
     final_issues = []
 
-    if len(review_reports) > 1 and not args.no_consolidate:
+    if review_reports and not args.no_consolidate:
         # Run consolidation with the configured default model unless overridden.
         consolidation_output = run_consolidation(
             repo_dir,
@@ -2072,6 +2084,7 @@ AI Tool Context Files:
             context,
             args.output,
             args.consolidation_model,
+            opencode_model=args.opencode_model,
             codex_use_sandbox=args.codex_use_sandbox,
             codex_reasoning_effort=args.codex_reasoning_effort,
         )
