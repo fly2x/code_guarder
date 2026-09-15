@@ -3,7 +3,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from scripts import fetch_pr
 
@@ -172,6 +172,67 @@ def create_remote_with_resolved_conflict_merge_pr(tmpdir: Path) -> Path:
     git(source, "push", "origin", "br-0.3")
     git(source, "push", "origin", "contributor:refs/merge-requests/11/head")
     return origin
+
+
+class GitLabUrlTests(unittest.TestCase):
+    def test_parse_gitlab_urls(self):
+        cases = [
+            ("https://gitlab.com/owner/repo/-/merge_requests/12", "owner", "https://gitlab.com"),
+            ("https://codehub.com/owner/repo/merge_requests/12", "owner", "https://codehub.com"),
+            ("codehub.com/repo/merge_requests/12", "", "https://codehub.com"),
+            ("http://codehub.com:8080/group/subgroup/repo/-/merge_requests/12/?tab=diffs#note", "group/subgroup", "http://codehub.com:8080"),
+        ]
+        for url, owner, origin in cases:
+            with self.subTest(url=url):
+                pr = fetch_pr.parse_pr_url(url)
+                self.assertIsNotNone(pr)
+                self.assertEqual((pr.platform, pr.owner, pr.repo, pr.pr_id),
+                                 ("gitlab", owner, "repo", "12"))
+                project = f"{owner}/repo" if owner else "repo"
+                self.assertEqual(pr.clone_url, f"{origin}/{project}.git")
+
+    def test_gitlab_api_uses_instance_and_full_project_path(self):
+        for owner, project_id in [("", "repo"), ("group/subgroup", "group%2Fsubgroup%2Frepo")]:
+            with self.subTest(owner=owner):
+                project = f"{owner}/repo" if owner else "repo"
+                pr = fetch_pr.PRInfo(
+                    platform="gitlab", owner=owner, repo="repo", pr_id="12",
+                    url=f"http://codehub.com:8080/{project}/merge_requests/12",
+                )
+                response = MagicMock()
+                response.__enter__.return_value.read.return_value = b'{"title":"Self-hosted MR"}'
+                api_url = f"http://codehub.com:8080/api/v4/projects/{project_id}/merge_requests/12"
+                with patch("scripts.fetch_pr.urllib.request.urlopen", return_value=response) as request:
+                    fetch_pr.fetch_pr_metadata(pr)
+                    self.assertEqual(request.call_args.args[0].full_url, api_url)
+                    self.assertEqual(pr.title, "Self-hosted MR")
+
+                    response.__enter__.return_value.read.return_value = b'[{"old_path":"a.c","new_path":"a.c","diff":"@@ -1 +1 @@\\n-old\\n+new"}]'
+                    diff = fetch_pr.fetch_gitlab_diff(pr, "token")
+                    self.assertEqual(request.call_args.args[0].full_url,
+                                     f"{api_url}/diffs?page=1&per_page=100")
+                    self.assertIn("+new", diff)
+
+    def test_other_platforms_still_parse(self):
+        for host, route, platform in [
+            ("github.com", "pull", "github"),
+            ("gitcode.com", "pull", "gitcode"),
+            ("gitee.com", "pulls", "gitee"),
+        ]:
+            with self.subTest(platform=platform):
+                pr = fetch_pr.parse_pr_url(f"https://{host}/owner/repo/{route}/12")
+                self.assertEqual(pr.platform, platform)
+                self.assertEqual(pr.clone_url, f"https://{host}/owner/repo.git")
+
+    def test_reject_invalid_gitlab_urls(self):
+        for url in [
+            "https://codehub.com/repo/merge_requests/12oops",
+            "https://codehub.com/merge_requests/12",
+            "https://codehub.com/repo/merge_requests/12/extra",
+            "ftp://codehub.com/repo/merge_requests/12",
+        ]:
+            with self.subTest(url=url):
+                self.assertIsNone(fetch_pr.parse_pr_url(url))
 
 
 class FetchPrTargetBranchTests(unittest.TestCase):
