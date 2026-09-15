@@ -40,7 +40,7 @@ class PRInfo:
     url: str
     title: str = ""
     author: str = ""
-    base_branch: str = "main"
+    base_branch: str = ""
     head_branch: str = ""
     clone_url: str = ""
 
@@ -235,6 +235,30 @@ def _git_stdout(repo_dir: Path, env: dict, args: list[str]) -> str:
     return result.stdout.strip()
 
 
+def _resolve_target_branch(repo_dir: Path, env: dict, pr: PRInfo) -> str:
+    """Preserve the PR target, or discover the remote default branch."""
+    if (pr.base_branch or '').strip():
+        return pr.base_branch.strip()
+
+    result = subprocess.run(
+        ['git', 'ls-remote', '--symref', 'origin', 'HEAD', 'refs/heads/main', 'refs/heads/master'],
+        cwd=repo_dir, env=env, check=True,
+        capture_output=True, text=True, timeout=120,
+    )
+    refs = set()
+    for line in result.stdout.splitlines():
+        value, _, ref = line.partition('\t')
+        if ref == 'HEAD' and value.startswith('ref: refs/heads/'):
+            pr.base_branch = value.removeprefix('ref: refs/heads/')
+            return pr.base_branch
+        refs.add(ref)
+    for branch in ('main', 'master'):
+        if f'refs/heads/{branch}' in refs:
+            pr.base_branch = branch
+            return branch
+    raise RuntimeError('Cannot determine target branch: remote HEAD, main and master are unavailable')
+
+
 def _fetch_target_branch(repo_dir: Path, env: dict, base_branch: str, quiet: bool = False) -> None:
     subprocess.run(
         [
@@ -263,7 +287,7 @@ def _prepare_merge_review_branch(
     workspace usable by reviewing the PR head against its merge-base with the
     target branch.
     """
-    base_branch = (pr.base_branch or 'main').strip() or 'main'
+    base_branch = _resolve_target_branch(repo_dir, env, pr)
 
     try:
         _fetch_target_branch(repo_dir, env, base_branch, quiet=quiet)
@@ -516,6 +540,8 @@ def clone_pr_repo(
             raise RuntimeError(f"Git fetch PR ref failed (exit {e.returncode}): {e.stderr.decode() if e.stderr else 'unknown error'}")
         except subprocess.TimeoutExpired:
             raise RuntimeError("Git fetch timed out after 120 seconds")
+
+        pr.base_branch = _resolve_target_branch(repo_dir, env, pr)
 
         # Ensure we have enough history for merge-base fallback in shallow clones.
         try:

@@ -236,6 +236,41 @@ class GitLabUrlTests(unittest.TestCase):
 
 
 class FetchPrTargetBranchTests(unittest.TestCase):
+    def test_detect_remote_default_branch_without_pr_metadata(self):
+        cases = [
+            ("main", True, True),
+            ("master", False, True),
+            ("master", True, True),
+            ("main", True, False),
+            ("master", False, False),
+        ]
+        for default_branch, keep_main, valid_head in cases:
+            with self.subTest(default_branch=default_branch, keep_main=keep_main, valid_head=valid_head):
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    root = Path(tmpdir)
+                    origin = create_remote_with_non_main_target(root)
+                    target = git(origin, "rev-parse", "refs/heads/br-0.3").stdout.strip()
+                    git(origin, "update-ref", f"refs/heads/{default_branch}", target)
+                    git(origin, "symbolic-ref", "HEAD", f"refs/heads/{default_branch if valid_head else 'missing'}")
+                    if not keep_main:
+                        git(origin, "update-ref", "-d", "refs/heads/main")
+
+                    for clone in (True, False):
+                        with self.subTest(clone=clone):
+                            pr = fetch_pr.parse_pr_url("https://gitcode.com/owner/repo/pull/8")
+                            pr.clone_url = str(origin)
+                            if clone:
+                                workspace = root / "workspace"
+                                workspace.mkdir()
+                                repo_dir, base_ref, head_ref = fetch_pr.clone_pr_repo(pr, workspace, quiet=True)
+                                self.assertEqual(base_ref, default_branch)
+                                self.assertEqual(fetch_pr.get_changed_files(repo_dir, base_ref, head_ref), ["feature.txt"])
+                            else:
+                                diff = fetch_pr.fetch_gitcode_diff_via_git(pr)
+                                self.assertIn("diff --git a/feature.txt b/feature.txt", diff)
+                                self.assertNotIn("target.txt", diff)
+                            self.assertEqual(pr.base_branch, default_branch)
+
     def test_git_auth_allows_terminal_prompts_without_token(self):
         for token in (None, ""):
             with self.subTest(token=token):
