@@ -8,7 +8,7 @@ Supports two modes:
 
 Supported URL formats:
 - GitHub:  https://github.com/owner/repo/pull/123
-- GitLab:  https://gitlab.com/owner/repo/-/merge_requests/123
+- GitLab:  https://<host>/<project-path>/-/merge_requests/123 (/- optional)
 - Gitee:   https://gitee.com/owner/repo/pulls/123
 - GitCode: https://gitcode.com/owner/repo/pull/123
 """
@@ -40,7 +40,7 @@ class PRInfo:
     url: str
     title: str = ""
     author: str = ""
-    base_branch: str = "main"
+    base_branch: str = ""
     head_branch: str = ""
     clone_url: str = ""
 
@@ -50,11 +50,23 @@ class PRInfo:
 
 def parse_pr_url(url: str) -> Optional[PRInfo]:
     """Parse PR/MR URL to extract components."""
+    parsed = urllib.parse.urlsplit(url if '://' in url else f'https://{url}')
+    gitlab_match = re.fullmatch(r'/([^/]+(?:/[^/]+)*?)/(?:-/)?merge_requests/(\d+)/?', parsed.path)
+    if parsed.scheme in ('http', 'https') and parsed.netloc and gitlab_match:
+        project_path, pr_id = gitlab_match.groups()
+        owner, _, repo = project_path.rpartition('/')
+        return PRInfo(
+            platform='gitlab',
+            owner=owner,
+            repo=repo,
+            pr_id=pr_id,
+            url=parsed.geturl(),
+            clone_url=f'{parsed.scheme}://{parsed.netloc}/{project_path}.git',
+        )
+
     patterns = [
         # GitHub: https://github.com/owner/repo/pull/123
         (r'github\.com/([^/]+)/([^/]+)/pull/(\d+)', 'github'),
-        # GitLab: https://gitlab.com/owner/repo/-/merge_requests/123
-        (r'gitlab\.com/([^/]+)/([^/]+)/-/merge_requests/(\d+)', 'gitlab'),
         # Gitee: https://gitee.com/owner/repo/pulls/123
         (r'gitee\.com/([^/]+)/([^/]+)/pulls/(\d+)', 'gitee'),
         # GitCode: https://gitcode.com/owner/repo/pull/123
@@ -71,7 +83,6 @@ def parse_pr_url(url: str) -> Optional[PRInfo]:
             # Generate clone URL
             clone_urls = {
                 'github': f'https://github.com/{owner}/{repo}.git',
-                'gitlab': f'https://gitlab.com/{owner}/{repo}.git',
                 'gitee': f'https://gitee.com/{owner}/{repo}.git',
                 'gitcode': f'https://gitcode.com/{owner}/{repo}.git',
             }
@@ -85,6 +96,14 @@ def parse_pr_url(url: str) -> Optional[PRInfo]:
                 clone_url=clone_urls[platform]
             )
     return None
+
+
+def _gitlab_project_api_url(pr: PRInfo) -> str:
+    """Build the project API URL on the MR's GitLab instance."""
+    parsed = urllib.parse.urlsplit(pr.url if '://' in pr.url else f'https://{pr.url}')
+    project_path = f'{pr.owner}/{pr.repo}' if pr.owner else pr.repo
+    project_id = urllib.parse.quote(project_path, safe='')
+    return f'{parsed.scheme}://{parsed.netloc}/api/v4/projects/{project_id}'
 
 
 def get_token(platform: str) -> Optional[str]:
@@ -216,6 +235,30 @@ def _git_stdout(repo_dir: Path, env: dict, args: list[str]) -> str:
     return result.stdout.strip()
 
 
+def _resolve_target_branch(repo_dir: Path, env: dict, pr: PRInfo) -> str:
+    """Preserve the PR target, or discover the remote default branch."""
+    if (pr.base_branch or '').strip():
+        return pr.base_branch.strip()
+
+    result = subprocess.run(
+        ['git', 'ls-remote', '--symref', 'origin', 'HEAD', 'refs/heads/main', 'refs/heads/master'],
+        cwd=repo_dir, env=env, check=True,
+        capture_output=True, text=True, timeout=120,
+    )
+    refs = set()
+    for line in result.stdout.splitlines():
+        value, _, ref = line.partition('\t')
+        if ref == 'HEAD' and value.startswith('ref: refs/heads/'):
+            pr.base_branch = value.removeprefix('ref: refs/heads/')
+            return pr.base_branch
+        refs.add(ref)
+    for branch in ('main', 'master'):
+        if f'refs/heads/{branch}' in refs:
+            pr.base_branch = branch
+            return branch
+    raise RuntimeError('Cannot determine target branch: remote HEAD, main and master are unavailable')
+
+
 def _fetch_target_branch(repo_dir: Path, env: dict, base_branch: str, quiet: bool = False) -> None:
     subprocess.run(
         [
@@ -244,7 +287,7 @@ def _prepare_merge_review_branch(
     workspace usable by reviewing the PR head against its merge-base with the
     target branch.
     """
-    base_branch = (pr.base_branch or 'main').strip() or 'main'
+    base_branch = _resolve_target_branch(repo_dir, env, pr)
 
     try:
         _fetch_target_branch(repo_dir, env, base_branch, quiet=quiet)
@@ -326,8 +369,7 @@ def fetch_pr_metadata(pr: PRInfo) -> PRInfo:
                 _update_pr_from_metadata(pr, data)
 
         elif pr.platform == 'gitlab':
-            project_id = urllib.parse.quote(f"{pr.owner}/{pr.repo}", safe='')
-            url = f"https://gitlab.com/api/v4/projects/{project_id}/merge_requests/{pr.pr_id}"
+            url = f"{_gitlab_project_api_url(pr)}/merge_requests/{pr.pr_id}"
             headers = {'User-Agent': 'code-guarder'}
             if token:
                 headers['PRIVATE-TOKEN'] = token
@@ -429,8 +471,8 @@ def create_git_credential_helper(platform: str, token: str) -> str:
 
 
 def configure_git_auth_env(env: dict, platform: str, token: Optional[str]) -> Optional[str]:
-    """Configure non-interactive git HTTPS authentication and return helper path."""
-    env['GIT_TERMINAL_PROMPT'] = '0'
+    """Use token authentication when available, otherwise allow Git prompts."""
+    env['GIT_TERMINAL_PROMPT'] = '0' if token else '1'
     if not token:
         return None
     cred_helper_path = create_git_credential_helper(platform, token)
@@ -457,7 +499,7 @@ def clone_pr_repo(
     clone_url = pr.clone_url
     repo_dir = target_dir / pr.repo
 
-    # Setup askpass helper for private repos and disable interactive prompts.
+    # Use an askpass helper for tokens, otherwise allow interactive prompts.
     cred_helper_path = None
     try:
         cred_helper_path = configure_git_auth_env(env, pr.platform, token)
@@ -498,6 +540,8 @@ def clone_pr_repo(
             raise RuntimeError(f"Git fetch PR ref failed (exit {e.returncode}): {e.stderr.decode() if e.stderr else 'unknown error'}")
         except subprocess.TimeoutExpired:
             raise RuntimeError("Git fetch timed out after 120 seconds")
+
+        pr.base_branch = _resolve_target_branch(repo_dir, env, pr)
 
         # Ensure we have enough history for merge-base fallback in shallow clones.
         try:
@@ -588,7 +632,7 @@ def fetch_github_diff(pr: PRInfo, token: Optional[str]) -> str:
 
 def fetch_gitlab_diff(pr: PRInfo, token: Optional[str]) -> str:
     """Fetch diff from GitLab using diffs API with pagination."""
-    project_id = urllib.parse.quote(f"{pr.owner}/{pr.repo}", safe='')
+    project_api_url = _gitlab_project_api_url(pr)
     headers = {'User-Agent': 'code-guarder'}
     if token:
         headers['PRIVATE-TOKEN'] = token
@@ -599,7 +643,7 @@ def fetch_gitlab_diff(pr: PRInfo, token: Optional[str]) -> str:
 
     try:
         while True:
-            url = (f"https://gitlab.com/api/v4/projects/{project_id}"
+            url = (f"{project_api_url}"
                    f"/merge_requests/{pr.pr_id}/diffs?page={page}&per_page={per_page}")
 
             req = urllib.request.Request(url, headers=headers)
