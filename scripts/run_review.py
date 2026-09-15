@@ -707,6 +707,7 @@ def init_agents_md(
     use_opencode: bool,
     codex_use_sandbox: bool = False,
     codex_reasoning_effort: Optional[str] = DEFAULT_CODEX_REASONING_EFFORT,
+    opencode_model: Optional[str] = None,
 ) -> bool:
     """Initialize the shared AGENTS.md file for tools that consume it."""
     agents_md = repo_dir / "AGENTS.md"
@@ -721,7 +722,7 @@ def init_agents_md(
     ):
         return True
 
-    if use_opencode and init_opencode(repo_dir):
+    if use_opencode and init_opencode(repo_dir, model=opencode_model):
         return True
 
     return False
@@ -735,6 +736,7 @@ def init_ai_tools(
     use_opencode: bool,
     codex_use_sandbox: bool = False,
     codex_reasoning_effort: Optional[str] = DEFAULT_CODEX_REASONING_EFFORT,
+    opencode_model: Optional[str] = None,
 ) -> None:
     """Initialize all enabled AI tools in parallel."""
     print_header("Initializing AI Tools")
@@ -751,6 +753,7 @@ def init_ai_tools(
                 repo_dir,
                 use_codex=use_codex,
                 use_opencode=use_opencode,
+                opencode_model=opencode_model,
                 codex_use_sandbox=codex_use_sandbox,
                 codex_reasoning_effort=codex_reasoning_effort,
             ),
@@ -1375,6 +1378,7 @@ def run_consolidation(
     consolidation_model: str = DEFAULT_CONSOLIDATION_MODEL,
     codex_use_sandbox: bool = False,
     codex_reasoning_effort: Optional[str] = DEFAULT_CODEX_REASONING_EFFORT,
+    opencode_model: Optional[str] = None,
 ) -> Path:
     """Run AI CLI to consolidate all review reports.
 
@@ -1420,6 +1424,7 @@ def run_consolidation(
             repo_dir,
             prompt,
             output_file,
+            model=opencode_model,
         )),
     }
 
@@ -1780,6 +1785,7 @@ def run_parallel_reviews(
     use_opencode: bool = False,
     codex_use_sandbox: bool = False,
     codex_reasoning_effort: Optional[str] = DEFAULT_CODEX_REASONING_EFFORT,
+    opencode_model: Optional[str] = None,
 ) -> dict[str, Path]:
     """Run multiple AI reviews in parallel."""
 
@@ -1821,7 +1827,7 @@ def run_parallel_reviews(
                 reasoning_effort=codex_reasoning_effort,
             )
         elif reviewer == 'opencode':
-            result_file, _ = run_opencode_agent(repo_dir, prompt, output_file)
+            result_file, _ = run_opencode_agent(repo_dir, prompt, output_file, model=opencode_model)
         else:
             return reviewer, None, []
 
@@ -1902,6 +1908,8 @@ AI Tool Context Files:
                         help="Also run Claude Code review in parallel")
     parser.add_argument("--opencode", action="store_true",
                         help="Also run OpenCode CLI review in parallel")
+    parser.add_argument("--opencode-model", type=str, default=None, metavar="PROVIDER/MODEL",
+                        help="OpenCode model for review, initialization and OpenCode consolidation (default: CLI configuration)")
     parser.add_argument("--codex", "-x", action="store_true",
                         help="Explicitly enable Codex CLI review (default on)")
     parser.add_argument("--no-codex", action="store_true",
@@ -2039,6 +2047,7 @@ AI Tool Context Files:
             use_gemini,
             use_codex,
             use_opencode,
+            opencode_model=args.opencode_model,
             codex_use_sandbox=args.codex_use_sandbox,
             codex_reasoning_effort=args.codex_reasoning_effort,
         )
@@ -2052,6 +2061,7 @@ AI Tool Context Files:
         use_gemini=use_gemini,
         use_codex=use_codex,
         use_opencode=use_opencode,
+        opencode_model=args.opencode_model,
         codex_use_sandbox=args.codex_use_sandbox,
         codex_reasoning_effort=args.codex_reasoning_effort,
     )
@@ -2074,6 +2084,7 @@ AI Tool Context Files:
             context,
             args.output,
             args.consolidation_model,
+            opencode_model=args.opencode_model,
             codex_use_sandbox=args.codex_use_sandbox,
             codex_reasoning_effort=args.codex_reasoning_effort,
         )

@@ -119,6 +119,7 @@ Default layout for `openHiTLS/hitls4j` PR `35`:
 | `--claude` | Enable Claude Code parallel review |
 | `--gemini`, `-g` | Enable Gemini CLI parallel review |
 | `--opencode` | Enable OpenCode CLI parallel review |
+| `--opencode-model` | OpenCode model (`provider/model`) for review, initialization and OpenCode consolidation; defaults to CLI configuration |
 | `--codex`, `-x` | Enable Codex CLI parallel review (default on) |
 | `--no-codex` | Disable Codex CLI review |
 | `--codex-use-sandbox` | Run Codex with its internal sandbox instead of the default bypass mode |
