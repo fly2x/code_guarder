@@ -236,6 +236,25 @@ class GitLabUrlTests(unittest.TestCase):
 
 
 class FetchPrTargetBranchTests(unittest.TestCase):
+    def test_git_auth_allows_terminal_prompts_without_token(self):
+        for token in (None, ""):
+            with self.subTest(token=token):
+                env = {"GIT_TERMINAL_PROMPT": "0"}
+                with patch("scripts.fetch_pr.create_git_credential_helper") as helper:
+                    helper_path = fetch_pr.configure_git_auth_env(env, "gitlab", token)
+                self.assertIsNone(helper_path)
+                self.assertEqual(env["GIT_TERMINAL_PROMPT"], "1")
+                helper.assert_not_called()
+
+    def test_git_auth_keeps_token_authentication_noninteractive(self):
+        env = {"GIT_TERMINAL_PROMPT": "1"}
+        with patch("scripts.fetch_pr.create_git_credential_helper", return_value="/tmp/askpass") as helper:
+            helper_path = fetch_pr.configure_git_auth_env(env, "gitlab", "test-token")
+        self.assertEqual(helper_path, "/tmp/askpass")
+        self.assertEqual(env["GIT_ASKPASS"], helper_path)
+        self.assertEqual(env["GIT_TERMINAL_PROMPT"], "0")
+        helper.assert_called_once_with("gitlab", "test-token")
+
     def test_git_askpass_helper_returns_prompt_specific_values(self):
         with patch.dict(os.environ, {"GITCODE_USERNAME": "alice"}, clear=False):
             helper_path = fetch_pr.create_git_credential_helper("gitcode", "tok'en value")

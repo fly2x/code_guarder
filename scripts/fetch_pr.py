@@ -447,8 +447,8 @@ def create_git_credential_helper(platform: str, token: str) -> str:
 
 
 def configure_git_auth_env(env: dict, platform: str, token: Optional[str]) -> Optional[str]:
-    """Configure non-interactive git HTTPS authentication and return helper path."""
-    env['GIT_TERMINAL_PROMPT'] = '0'
+    """Use token authentication when available, otherwise allow Git prompts."""
+    env['GIT_TERMINAL_PROMPT'] = '0' if token else '1'
     if not token:
         return None
     cred_helper_path = create_git_credential_helper(platform, token)
@@ -475,7 +475,7 @@ def clone_pr_repo(
     clone_url = pr.clone_url
     repo_dir = target_dir / pr.repo
 
-    # Setup askpass helper for private repos and disable interactive prompts.
+    # Use an askpass helper for tokens, otherwise allow interactive prompts.
     cred_helper_path = None
     try:
         cred_helper_path = configure_git_auth_env(env, pr.platform, token)
