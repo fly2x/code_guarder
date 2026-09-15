@@ -385,6 +385,44 @@ class ConsolidationTests(unittest.TestCase):
 
 
 class MainDefaultsTests(unittest.TestCase):
+    def test_single_reviewer_is_revalidated_unless_disabled(self):
+        for skip in (False, True):
+            with self.subTest(skip=skip), tempfile.TemporaryDirectory() as tmpdir:
+                root = Path(tmpdir)
+                context_path = root / "context.json"
+                context_path.write_text(json.dumps({"repo_dir": str(root)}))
+                output_dir = root / "out"
+                original = {"file": "a.c", "line": "1", "title": "Original", "source": "opencode"}
+                argv = ["run_review.py", "--context", str(context_path),
+                        "--no-codex", "--opencode", "--consolidation-model", "opencode",
+                        "--output", str(output_dir)]
+                if skip:
+                    argv.append("--no-consolidate")
+
+                def consolidate(*args, **kwargs):
+                    result = output_dir / "consolidation_output.txt"
+                    result.write_text("===ISSUE===\nFILE: a.c\nLINE: 1\nTITLE: Verified\n"
+                                      "SEVERITY: high\nREVIEWERS: opencode\nCONFIDENCE: likely\n"
+                                      "PROBLEM: Verified problem\nCODE:\n```c\nbad();\n```\n"
+                                      "FIX:\n```c\ngood();\n```\n===END===\n")
+                    return result
+
+                with patch.object(run_review.sys, "argv", argv), patch(
+                    "scripts.run_review.run_parallel_reviews",
+                    return_value=({"opencode": root / "opencode_review.md"}, {"opencode": [original]}),
+                ), patch("scripts.run_review.run_consolidation", side_effect=consolidate) as review:
+                    run_review.main()
+                issue = json.loads((output_dir / "final_report.json").read_text())["issues"][0]
+                if skip:
+                    review.assert_not_called()
+                    self.assertEqual(issue["title"], "Original")
+                else:
+                    review.assert_called_once()
+                    self.assertEqual(review.call_args.args[4], "opencode")
+                    self.assertEqual(issue["title"], "Verified")
+                    self.assertEqual(issue["confidence"], "likely")
+                    self.assertEqual(issue["fix"], "good();")
+
     def test_main_defaults_to_codex_spark_consolidation_and_xhigh_effort(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmpdir_path = Path(tmpdir)
@@ -490,6 +528,7 @@ class MainDefaultsTests(unittest.TestCase):
                     str(context_path),
                     "--no-codex",
                     "--opencode",
+                    "--no-consolidate",
                     "--output",
                     str(output_dir),
                 ],

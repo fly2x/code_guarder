@@ -1094,6 +1094,7 @@ class RunReviewIntegrationTests(unittest.TestCase):
                     "--output",
                     str(output_dir),
                     "--publish-comments",
+                    "--no-consolidate",
                 ],
             ):
                 with patch("scripts.run_review.run_parallel_reviews", return_value=({"codex": output_dir / "codex_review.md"}, {"codex": [issue]})):

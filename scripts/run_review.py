@@ -1263,7 +1263,7 @@ def generate_html_report(issues: list[dict], context: dict, reviewer: str = '') 
 # =============================================================================
 
 def generate_consolidation_prompt(review_reports: dict[str, Path], context: dict) -> str:
-    """Generate prompt for Codex to consolidate multiple reviews."""
+    """Generate a prompt to validate and consolidate review reports."""
 
     reports_content = []
     for reviewer, report_path in review_reports.items():
@@ -1287,7 +1287,8 @@ Issues that violate these rules should be given higher priority:
 
     prompt = f"""# Change Review Consolidation Task
 
-You are consolidating change review findings from multiple AI reviewers.
+You are validating and consolidating change review findings from one or more AI reviewers.
+For a single report, independently recheck every finding against the repository.
 
 ## Context
 - Repository: {context.get('owner', '')}/{context.get('repo', '')}
@@ -1310,6 +1311,7 @@ You are consolidating change review findings from multiple AI reviewers.
    - Use `git diff` and file reads to confirm
    - Remove false positives
    - Adjust severity if needed
+   - Verify the proposed fix; supply a concrete fix if it is missing or incorrect
 
 3. **Consolidate Findings**
    - Merge duplicate issues (note which reviewers found it)
@@ -2060,11 +2062,11 @@ AI Tool Context Files:
                            (r == 'codex' and use_codex) or
                            (r == 'opencode' and use_opencode)]
 
-    # Phase 2: Consolidation (if multiple reviewers or explicitly requested)
+    # Phase 2: Validate and consolidate available reports unless disabled.
     total_issues = sum(len(issues) for issues in all_issues.values())
     final_issues = []
 
-    if len(review_reports) > 1 and not args.no_consolidate:
+    if review_reports and not args.no_consolidate:
         # Run consolidation with the configured default model unless overridden.
         consolidation_output = run_consolidation(
             repo_dir,
