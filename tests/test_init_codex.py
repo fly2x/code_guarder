@@ -158,6 +158,68 @@ class CodexCommandTests(unittest.TestCase):
 
 
 class ReviewPromptTests(unittest.TestCase):
+    def test_test_review_records_are_required_without_conflicting_output_rules(self):
+        for prompt in (
+            run_review.generate_review_prompt({}),
+            run_review.generate_consolidation_prompt({}, {}),
+        ):
+            with self.subTest(prompt=prompt[:30]):
+                self.assertIn("===TEST_REVIEW===", prompt)
+                self.assertIn("===END_TEST_REVIEW===", prompt)
+                self.assertIn("STEP_1:", prompt)
+                self.assertIn("STEP_9:", prompt)
+                self.assertIn("even when no issue is found", prompt)
+                self.assertNotIn("ONLY output ===ISSUE===", prompt)
+                self.assertNotIn("ONLY output should be ===ISSUE===", prompt)
+
+    def test_test_review_records_do_not_interfere_with_issue_parsing(self):
+        output = ("===TEST_REVIEW===\nCASE: tests/test_a.py::test_a\n"
+                  "STEP_1: inspected tests/test_a.py:1\n===END_TEST_REVIEW===\n"
+                  "===ISSUE===\nFILE: src/a.py\nLINE: 2\nTITLE: Bug\n"
+                  "PROBLEM: Broken\n===END===\n")
+        for parser in (run_review.parse_issues, run_review.parse_consolidated_issues):
+            with self.subTest(parser=parser.__name__):
+                issues = parser(output)
+                self.assertEqual(len(issues), 1)
+                self.assertEqual(issues[0]["file"], "src/a.py")
+                self.assertEqual(issues[0]["title"], "Bug")
+
+    def test_test_quality_rules_reach_review_and_validation(self):
+        context = {"changed_files": ["tests/test_parser.py"]}
+        prompts = {
+            "review": run_review.generate_review_prompt(context),
+            "validation": run_review.generate_consolidation_prompt({}, context),
+        }
+        for phase, prompt in prompts.items():
+            with self.subTest(phase=phase):
+                steps = (
+                    "1. Identify test changes",
+                    "2. Establish intended behavior",
+                    "3. Check discovery and setup",
+                    "4. Trace execution",
+                    "5. Check assertions",
+                    "6. Challenge effectiveness",
+                    "7. Find comparable tests",
+                    "8. Decide redundancy",
+                    "9. Report with evidence",
+                )
+                positions = [prompt.index(step) for step in steps]
+                self.assertEqual(positions, sorted(positions))
+                for requirement in (
+                    "Complete the steps in order",
+                    "Test effectiveness",
+                    "trace inputs through the real code path to meaningful assertions",
+                    "faulty implementation that would still pass",
+                    "over-mocking",
+                    "fail before the fix and pass after it",
+                    "Test redundancy",
+                    "cite the existing test's path and name",
+                    "different inputs alone do not prove redundancy",
+                    "Do NOT run tests or claim runtime verification",
+                    "Only report defects introduced or worsened by changed lines",
+                ):
+                    self.assertIn(requirement, prompt)
+
     def test_generate_review_prompt_enforces_local_only_review(self):
         prompt = run_review.generate_review_prompt({
             "repo_dir": "workspace/repo",

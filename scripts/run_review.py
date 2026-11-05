@@ -96,6 +96,84 @@ def print_warning(msg: str):
 # Review Prompt Generation
 # =============================================================================
 
+TEST_REVIEW_RULES = """## Test Code Review Rules
+
+Complete the steps in order for each changed test or affected test case. For consolidation,
+apply them to each reported test finding to independently verify its evidence. Use local
+static inspection. Do NOT run tests or claim runtime verification.
+
+1. Identify test changes
+   - Inspect the diff for tests, fixtures, helpers, data, registration, and test configuration.
+   - Map changed shared fixtures and helpers to the tests they affect. Do not rely on filenames alone.
+
+2. Establish intended behavior
+   - Identify the behavior, input, expected result, and risk each case is intended to verify.
+   - Read the changed implementation, relevant callers, contracts, and prior behavior as needed.
+
+3. Check discovery and setup
+   - Check test registration, naming, selection, skips, feature flags, and build configuration.
+   - Verify fixtures, inputs, dependencies, and cleanup allow the intended case to execute.
+   - Identify conditions that prevent execution or silently turn failures into passes.
+
+4. Trace execution
+   - Follow the input through setup, calls, branches, error handling, and cleanup.
+   - Check that the intended implementation and branch are reached with the intended data.
+   - Check whether stubs or over-mocking replace the behavior the case claims to test.
+
+5. Check assertions
+   - Trace actual results and side effects to assertions, including asynchronous completion.
+   - Check failure propagation, exception expectations, missing assertions, and tautologies.
+   - Check that expected values come from an independent contract, not the same faulty logic.
+
+6. Challenge effectiveness
+   - Test effectiveness: trace inputs through the real code path to meaningful assertions.
+   - Describe a concrete faulty implementation that would still pass, or a specific
+     discovery/setup defect, and explain the defect that would escape detection.
+   - For regression cases, reason from the base and changed code whether the case would
+     fail before the fix and pass after it. State uncertainty when evidence is insufficient.
+
+7. Find comparable tests
+   - Search existing and newly added tests, including parameterized cases and shared helpers.
+   - Compare inputs, behavior, branches, boundaries, failure modes, and assertions.
+
+8. Decide redundancy
+   - Test redundancy: identify whether a changed case adds a distinct verification or risk.
+   - Similar structure or different inputs alone do not prove redundancy; consider boundary,
+     platform, configuration, and regression coverage before calling a case redundant.
+   - For a redundant case, identify the maintenance or runtime cost of keeping the duplicate.
+
+9. Report with evidence
+   - Only report defects introduced or worsened by changed lines; anchor FILE/LINE there.
+   - For ineffective tests, describe the execution path, missed failure, and supporting code.
+   - For redundancy, cite the existing test's path and name in PROBLEM, and explain the
+     overlapping behavior, inputs, assertions, and why the changed case adds no coverage.
+   - Give a concrete fix. If evidence is insufficient, do not claim a confirmed defect.
+
+## Mandatory Test Review Records
+
+Output one record for each case reviewed, even when no issue is found. Write all nine
+steps in order. For each step, include its conclusion and repository-relative evidence
+(file and line, test name, or search performed and result). State uncertainty or why a
+step is not applicable; never invent evidence. For consolidation, record each reported
+test finding, including findings rejected after verification. If no case or finding is
+in scope, output one record with CASE: none and explain the scope in STEP_1; mark the
+remaining steps not applicable. Keep records outside issue blocks.
+
+===TEST_REVIEW===
+CASE: <test path and name, or none>
+STEP_1: <changes and evidence>
+STEP_2: <intended behavior and evidence>
+STEP_3: <discovery and setup evidence>
+STEP_4: <execution path and evidence>
+STEP_5: <assertions and evidence>
+STEP_6: <effectiveness assessment and evidence>
+STEP_7: <comparable tests or search and result>
+STEP_8: <redundancy assessment and evidence>
+STEP_9: <finding or reason for no finding>
+===END_TEST_REVIEW===
+"""
+
+
 def generate_review_prompt(context: dict, reviewer: str = 'codex') -> str:
     """Generate the review prompt for agent mode."""
 
@@ -182,10 +260,11 @@ Perform a thorough change review by:
      broken references, misleading examples, missing steps, or unsafe guidance
    - Config/build/CI: insecure defaults, mismatched versions, missing required keys
 {custom_rules_section}
+{TEST_REVIEW_RULES}
 ## Output Format - CRITICAL
 
-You MUST output each issue in the EXACT format below. Do NOT output summaries, tables, or prose.
-Your ONLY output should be ===ISSUE=== blocks. No introduction, no conclusion.
+You MUST output test review records as specified above and each issue in the EXACT format
+below. Do NOT output summaries, tables, introductions, or conclusions.
 
 For each issue found, output EXACTLY:
 
@@ -207,16 +286,16 @@ FIX:
 
 ## Rules
 
-- ONLY output ===ISSUE=== blocks, nothing else
+- Output only test review records and ===ISSUE=== blocks
 - Do NOT write summaries or conclusions
-- Do NOT use markdown headers or bullet points outside of issue blocks
+- Do NOT use markdown headers or bullet points outside of these blocks
 - Use repository-relative paths in FILE; do NOT output absolute local filesystem paths
 - Only flag issues in CHANGED lines (code or docs, not pre-existing issues)
 - Be specific with line numbers
 - Provide working fixes, not just descriptions
   - For docs, FIX should be the corrected text/snippet
 
-Start the review now. Output each issue as you find it.
+Start the review now. Output the required records and issues.
 """
     return prompt
 
@@ -910,9 +989,9 @@ def run_claude_agent(repo_dir: Path, prompt: str, output_file: Path) -> tuple[Pa
 
     # Format instruction to enforce structured output
     format_instruction = (
-        "CRITICAL: Your ONLY output must be ===ISSUE=== blocks. "
+        "CRITICAL: Output the required ===TEST_REVIEW=== records and ===ISSUE=== blocks. "
         "Do NOT write summaries, introductions, or conclusions. "
-        "Output each issue immediately when found in the exact format specified."
+        "Use the exact formats specified in the task."
     )
 
     config = AgentConfig(
@@ -1298,6 +1377,7 @@ For a single report, independently recheck every finding against the repository.
 - PR: #{context.get('pr_id', '')}
 - Title: {context.get('title', '')}
 {custom_rules_section}
+{TEST_REVIEW_RULES}
 ## Individual Review Reports
 
 {all_reports}
@@ -1360,7 +1440,8 @@ FIX:
 
 ## CRITICAL OUTPUT REQUIREMENT
 
-You MUST output each issue in the exact ===ISSUE===...===END=== format shown above.
+You MUST output the required test review records and each issue in the exact
+===ISSUE===...===END=== format shown above.
 Do NOT output summary tables or prose descriptions.
 Each issue MUST be a separate ===ISSUE=== block.
 If there are 5 validated issues, output 5 ===ISSUE=== blocks.
